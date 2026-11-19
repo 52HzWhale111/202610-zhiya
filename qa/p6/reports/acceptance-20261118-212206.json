@@ -7,11 +7,11 @@
     "mode": "black-box-http",
     "total": 41,
     "counts": {
-      "PASS": 32,
+      "PASS": 31,
       "FAIL": 0,
       "BLOCKED": 6,
       "SKIP": 0,
-      "WARN": 3
+      "WARN": 4
     },
     "byAC": {
       "NFR-02": {
@@ -43,7 +43,7 @@
         "PASS": 4
       },
       "AC-14": {
-        "PASS": 1
+        "WARN": 1
       },
       "AC-10": {
         "PASS": 1
@@ -94,7 +94,8 @@
       "TC-P6-AGENT-003",
       "TC-P6-ACT-001"
     ],
-    "finishedAt": "2026-11-18T13:22:06Z"
+    "finishedAt": "2026-11-18T13:22:06Z",
+    "testedCommit": "ead1debaaf1eb5eb14e1a79503371667d790c4c1"
   },
   "results": [
     {
@@ -177,8 +178,16 @@
       "detail": "account=p6a1118212204dcae",
       "evidence": {
         "cookieFlags": {
-          "session": "zhiya_session=bKxdb45EK6-LsxlitxIHE9qGBQfpyH0ZpIGgcGx6Uf8; HttpOnly; Max-Age=86400; Path=/; SameSite=lax; Secure",
-          "csrf": "zhiya_csrf=ebf3f7c42ca3b019846e9d7d158e2fcc84e30c5f80f166a48c940f7166beb5ee; Max-Age=86400; Path=/; SameSite=lax; Secure"
+          "session": {
+            "secure": true,
+            "httpOnly": true,
+            "sameSiteLax": true
+          },
+          "csrf": {
+            "secure": true,
+            "httpOnly": false,
+            "sameSiteLax": true
+          }
         }
       },
       "started_at": "2026-11-18T13:22:04Z",
@@ -337,8 +346,8 @@
       "case_id": "TC-P6-BRANCH-001",
       "title": "受控故事分支选择",
       "ac": "AC-14",
-      "status": "PASS",
-      "detail": "branchId=1, currentPage=2, revision=2",
+      "status": "WARN",
+      "detail": "branchId=1, currentPage=2, revision=2。仅验证一条审核分支及其重放、过期修订冲突。同一决策点两种不同后续、节点上限及无环约束尚未验收。",
       "evidence": {
         "branchId": 1,
         "nextPage": 2

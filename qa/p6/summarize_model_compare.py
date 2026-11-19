@@ -70,8 +70,8 @@ def summarize(plan: dict, results: list[dict], scores: list[dict], dimensions: l
                 if isinstance(value, int):
                     by_condition.setdefault(condition, {}).setdefault(dimension, []).append(value)
                     values.append(value)
-            if values:
-                per_case_condition[(case_id, condition)].append(round(statistics.mean(values), 3))
+            if values and len(values) == len(dimensions):
+                per_case_condition[(case_id, condition)].append(sum(values))
         for dimension in dimensions:
             first = row.get(f"rater1_{dimension}")
             second = row.get(f"rater2_{dimension}")
@@ -96,8 +96,9 @@ def summarize(plan: dict, results: list[dict], scores: list[dict], dimensions: l
         for case_id in case_ids:
             base = per_case_condition.get((case_id, "baseline"))
             domain = per_case_condition.get((case_id, "domain"))
-            if base and domain:
-                base_score, domain_score = base[-1], domain[-1]
+            if base and domain and len(base) == len(domain) == 2:
+                base_score = sum(base) / (2 * len(dimensions))
+                domain_score = sum(domain) / (2 * len(dimensions))
                 outcome = "胜" if domain_score > base_score else "平" if domain_score == base_score else "负"
                 pairs.append({"caseId": case_id, "baseline": base_score,
                               "domain": domain_score, "outcome": outcome})
@@ -111,7 +112,7 @@ def summarize(plan: dict, results: list[dict], scores: list[dict], dimensions: l
         "callBudget": plan["callBudget"],
         "resultRows": len(results),
         "scoredRows": sum(1 for row in scores if any(
-            isinstance(row.get(f"rater_{dimension}"), int)
+            isinstance(row.get(f"{rater}_{dimension}"), int)
             for rater in ("rater1", "rater2") for dimension in dimensions)),
         "conditionMeans": condition_means,
         "paired": {"wins": wins, "ties": ties, "losses": losses, "cases": pairs},

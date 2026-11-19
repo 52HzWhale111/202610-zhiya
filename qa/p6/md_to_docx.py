@@ -26,7 +26,6 @@ META = [
     ("编写", "刘俊延（102401133，测试验收演示）"),
     ("版本", "v1.0"),
     ("日期", "2026-11-18"),
-    ("被测提交", "eb91092563a0ec0b46ed66bf6c034310ea5cd0fd"),
 ]
 
 
@@ -153,7 +152,7 @@ def add_cover(doc: Document, title_text: str = TITLE, subtitle_text: str = SUBTI
     doc.add_paragraph()
     note = doc.add_paragraph()
     note.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = note.add_run("本地测试已执行；公网验收与真实模型对比待执行\n本文件不把未实现、未执行或阻塞项记为通过")
+    run = note.add_run("各项验收状态及证据来源见正文。")
     run.font.size = Pt(9)
     run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
 
@@ -199,7 +198,7 @@ def add_inline(paragraph, text: str) -> None:
 def add_table(doc: Document, rows: list[str]) -> None:
     parsed = []
     for row in rows:
-        cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
+        cells = [cell.strip().replace(r"\|", "|") for cell in re.split(r"(?<!\\)\|", row.strip().strip("|"))]
         parsed.append(cells)
     if len(parsed) < 2:
         return
@@ -276,7 +275,9 @@ def build(markdown: Path, output: Path, *, title_text: str = TITLE, subtitle_tex
         lines.pop(0)
     doc = Document()
     style_document(doc, header_text)
-    add_cover(doc, title_text, subtitle_text)
+    match = re.search(r"(?m)^- 被测提交：`([^`\n]+)`", text)
+    commit = match.group(1) if match else "未记录"
+    add_cover(doc, title_text, subtitle_text, [*META, ("被测提交", commit)])
 
     index = 0
     first_h1 = True

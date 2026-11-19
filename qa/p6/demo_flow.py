@@ -15,11 +15,12 @@ import json
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import ApiSession, error_code, response_json, unique_suffix  # noqa: E402
+from common import ApiSession, error_code, loopback_host, response_json, unique_suffix  # noqa: E402
 
 
 def step(number: int, title: str) -> None:
@@ -52,6 +53,25 @@ def expect(response, status: int, code: str | None = None) -> dict:
     return body or {}
 
 
+def demo_voice(client: ApiSession, profile_id: int, version_id: int, *, enabled: bool) -> None:
+    if not enabled:
+        print("本轮跳过合成，使用归档报告讲解未配置时的 503 与文字回退。")
+        return
+    voice_session = expect(client.post("/api/v1/reading-sessions", csrf=True, json={
+        "childProfileId": profile_id,
+        "storyVersionId": version_id,
+        "mode": "PARENT_CHILD",
+    }), 201)["data"]["readingSessionId"]
+    expect(client.post(f"/api/v1/reading-sessions/{voice_session}/events", csrf=True, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0,
+        "clientEventId": f"demo-voice-{uuid4().hex[:8]}",
+    }), 201)
+    synthesis_body = {"readingSessionId": voice_session, "pageNumber": 1, "revision": 1}
+    voice = client.post("/api/v1/voice/syntheses", csrf=True, json=synthesis_body)
+    print(f"真实合成：HTTP {voice.status_code}")
+    show(voice)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8765")
@@ -64,6 +84,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pause", action="store_true", help="每一步暂停，适合现场演示")
     parser.add_argument("--voice", action="store_true", help="尝试真实 TTS（会产生费用）")
     args = parser.parse_args(argv)
+    if args.insecure_tls and not loopback_host(urlsplit(args.base_url).hostname or ""):
+        parser.error("登录演示需要校验 HTTPS 证书")
 
     client = ApiSession(args.base_url, timeout=args.timeout, verify=not args.insecure_tls,
                         allow_insecure_cookies=args.allow_http)
@@ -195,24 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     pause(args.pause)
 
     step(11, "语音接口的安全回退（默认不产生付费调用）")
-    voice_session = expect(client.post("/api/v1/reading-sessions", csrf=True, json={
-        "childProfileId": profile["childProfileId"],
-        "storyVersionId": book["storyVersionId"],
-        "mode": "PARENT_CHILD",
-    }), 201)["data"]["readingSessionId"]
-    expect(client.post(f"/api/v1/reading-sessions/{voice_session}/events", csrf=True, json={
-        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0,
-        "clientEventId": f"demo-voice-{uuid4().hex[:8]}",
-    }), 201)
-    synthesis_body = {"readingSessionId": voice_session, "pageNumber": 1, "revision": 1}
-    if args.voice:
-        voice = client.post("/api/v1/voice/syntheses", csrf=True, json=synthesis_body)
-        print(f"真实合成：HTTP {voice.status_code}")
-        show(voice)
-    else:
-        voice = client.post("/api/v1/voice/syntheses", csrf=True, json=synthesis_body)
-        print(f"未启用 --voice；合成接口返回 HTTP {voice.status_code} {error_code(voice)}")
-        print("讲解：TTS 未配置时安全失败，前端应回退为文字回答；不会阻断图文共读。")
+    demo_voice(client, profile["childProfileId"], book["storyVersionId"], enabled=args.voice)
     pause(args.pause)
 
     step(12, "演示结束")

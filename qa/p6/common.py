@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import secrets
@@ -65,6 +66,20 @@ class Result:
         return asdict(self)
 
 
+def loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def loopback_http(url: str) -> bool:
+    target = httpx.URL(url)
+    return target.scheme == "http" and loopback_host(target.host)
+
+
 class ApiSession:
     """带 Cookie 持久化的 HTTP 客户端。
 
@@ -76,7 +91,7 @@ class ApiSession:
     def __init__(self, base_url: str, *, timeout: float = 20.0, verify: bool = True,
                  allow_insecure_cookies: bool = False, trust_env: bool = False) -> None:
         self.base_url = base_url.rstrip("/")
-        self.allow_insecure_cookies = allow_insecure_cookies
+        self.allow_insecure_cookies = allow_insecure_cookies and loopback_http(self.base_url)
         # 默认忽略系统代理：Windows 注册表代理会把本机 POST 请求交给代理，导致请求体
         # 被丢弃并返回 422。确实需要代理时设置 ZHIYA_USE_ENV_PROXY=1。
         trust_env = trust_env or os.environ.get("ZHIYA_USE_ENV_PROXY") == "1"
@@ -97,25 +112,26 @@ class ApiSession:
     def session_cookie(self) -> str | None:
         return self.client.cookies.get("zhiya_session")
 
-    def _sync_cookies(self, response: httpx.Response) -> None:
-        for cookie in response.cookies.jar:
-            # 覆盖 response 解析出的 Secure 属性，便于本地 HTTP 测试；HTTPS 仍按正常方式发送。
-            self.client.cookies.set(
-                cookie.name,
-                cookie.value,
-                domain=self.client.base_url.host,
-                path=cookie.path or "/",
-            )
+    def _allow_local_cookies(self) -> None:
+        if self.allow_insecure_cookies:
+            for cookie in self.client.cookies.jar:
+                cookie.secure = False
 
     def request(self, method: str, path: str, *, csrf: bool = False,
                 headers: dict[str, str] | None = None, **kwargs) -> httpx.Response:
+        target = self.client.base_url.join(path)
+        base = self.client.base_url
+        if (target.scheme, target.host, target.port) != (base.scheme, base.host, base.port):
+            raise ValueError("请求地址须与被测服务同源")
+        if target.scheme != "https" and not self.allow_insecure_cookies:
+            raise ValueError("认证请求要求 HTTPS；本地回环 HTTP 须显式启用 --allow-http")
         request_headers = dict(headers or {})
         if csrf:
             token = self.csrf
             if token:
                 request_headers["X-CSRF-Token"] = token
         response = self.client.request(method, path, headers=request_headers, **kwargs)
-        self._sync_cookies(response)
+        self._allow_local_cookies()
         return response
 
     def get(self, path: str, **kwargs) -> httpx.Response:
@@ -134,7 +150,11 @@ class ApiSession:
         return self.request("DELETE", path, csrf=csrf, **kwargs)
 
     def set_cookie(self, name: str, value: str) -> None:
-        self.client.cookies.set(name, value, domain=self.client.base_url.host, path="/")
+        self.client.cookies.extract_cookies(httpx.Response(
+            200, headers={"Set-Cookie": f"{name}={value}; Path=/; Secure"},
+            request=httpx.Request("GET", self.base_url),
+        ))
+        self._allow_local_cookies()
 
     def close(self) -> None:
         self.client.close()
@@ -154,23 +174,14 @@ def error_code(response: httpx.Response) -> str | None:
     return None
 
 
-def set_cookie_header(response: httpx.Response, name: str) -> str | None:
-    prefix = f"{name}="
+def cookie_flags(response: httpx.Response, name: str) -> dict[str, bool]:
     for header in response.headers.get_list("set-cookie"):
-        if header.startswith(prefix):
-            return header
-    return None
-
-
-def has_cookie_flags(response: httpx.Response, name: str, flags: list[str]) -> tuple[bool, str]:
-    header = set_cookie_header(response, name)
-    if header is None:
-        return False, f"响应未设置 {name}"
-    lowered = header.lower()
-    missing = [flag for flag in flags if flag.lower() not in lowered]
-    if missing:
-        return False, f"{name} 缺少属性: {', '.join(missing)}"
-    return True, header
+        cookie, *attributes = header.split(";")
+        if cookie.partition("=")[0].strip() == name:
+            flags = {attribute.strip().lower() for attribute in attributes}
+            return {"secure": "secure" in flags, "httpOnly": "httponly" in flags,
+                    "sameSiteLax": "samesite=lax" in flags}
+    raise AssertionError(f"响应未设置 {name}")
 
 
 class Recorder:
@@ -265,6 +276,7 @@ def write_reports(recorder: Recorder, outdir: Path, *, title: str = "知芽 P6 �
         "",
         f"- 开始时间：{recorder.meta.get('startedAt', '')}",
         f"- 结束时间：{summary['finishedAt']}",
+        f"- 被测提交：{recorder.meta.get('testedCommit', '未记录')}",
         f"- 被测地址：{recorder.meta.get('baseUrl', '')}",
         f"- 测试环境：{recorder.meta.get('profile', '')}",
         "",
@@ -299,7 +311,7 @@ def write_reports(recorder: Recorder, outdir: Path, *, title: str = "知芽 P6 �
         "name": title,
         "tests": str(len(recorder.results)),
         "failures": str(summary["counts"][FAIL]),
-        "skipped": str(summary["counts"][BLOCKED] + summary["counts"][SKIP]),
+        "skipped": str(sum(summary["counts"][s] for s in (BLOCKED, SKIP, WARN))),
         "time": f"{sum(r.duration_ms for r in recorder.results) / 1000:.3f}",
     })
     for result in recorder.results:
@@ -311,10 +323,8 @@ def write_reports(recorder: Recorder, outdir: Path, *, title: str = "知芽 P6 �
         if result.status == FAIL:
             failure = ET.SubElement(case, "failure", {"message": result.detail})
             failure.text = result.detail
-        elif result.status in (BLOCKED, SKIP):
-            ET.SubElement(case, "skipped", {"message": result.detail})
-        if result.status == WARN:
-            ET.SubElement(case, "system-out").text = f"WARN: {result.detail}"
+        elif result.status in (BLOCKED, SKIP, WARN):
+            ET.SubElement(case, "skipped", {"type": result.status, "message": result.detail})
     xml_path = outdir / f"acceptance-{suffix}.xml"
     ET.ElementTree(suite).write(xml_path, encoding="utf-8", xml_declaration=True)
 

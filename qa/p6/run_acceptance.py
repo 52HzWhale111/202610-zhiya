@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import time
@@ -34,9 +35,10 @@ from common import (
     Recorder,
     Warn,
     error_code,
-    has_cookie_flags,
+    cookie_flags,
+    loopback_host,
+    loopback_http,
     response_json,
-    set_cookie_header,
     unique_suffix,
     write_reports,
 )
@@ -118,6 +120,8 @@ class Acceptance:
         self.rec = Recorder()
         self.rec.meta.update({"baseUrl": args.base_url, "profile": args.profile,
                               "mode": "black-box-http"})
+        if args.tested_commit:
+            self.rec.meta["testedCommit"] = args.tested_commit
         self.a = ApiSession(args.base_url, timeout=args.timeout,
                             verify=not args.insecure_tls,
                             allow_insecure_cookies=args.allow_http)
@@ -148,10 +152,15 @@ class Acceptance:
 
     # ---------- 环境与健康 ----------
 
-    def test_environment(self) -> None:
-        scheme = "https" if self.args.base_url.startswith("https://") else "http"
-        if self.args.profile == "public" and scheme != "https" and not self.args.allow_http:
-            raise AssertionError("公网验收要求 HTTPS；如确为内网自测请加 --allow-http")
+    def test_environment(self) -> str:
+        target = httpx.URL(self.args.base_url)
+        scheme = target.scheme
+        if self.args.profile != "public" and self.args.insecure_tls and not loopback_host(target.host):
+            raise AssertionError("非回环 HTTPS 服务必须校验证书")
+        if scheme != "https" and not (
+            self.args.profile == "local" and self.args.allow_http and loopback_http(self.args.base_url)
+        ):
+            raise AssertionError("验收要求 HTTPS；仅本地回环地址可显式使用 --allow-http")
         return f"scheme={scheme}, profile={self.args.profile}"
 
     def test_health(self) -> tuple[str, dict]:
@@ -212,18 +221,15 @@ class Acceptance:
         response = self.login(self.a, account, password)
         body = expect(response, 201, label="登录")
         expect_envelope(body, response, "登录")
-        session_ok, session_detail = has_cookie_flags(
-            response, "zhiya_session", ["secure", "httponly", "samesite=lax"])
-        csrf_ok, csrf_detail = has_cookie_flags(response, "zhiya_csrf", ["samesite=lax"])
-        if not session_ok:
-            raise AssertionError(session_detail)
-        if not csrf_ok:
-            raise AssertionError(csrf_detail)
-        if "httponly" in (set_cookie_header(response, "zhiya_csrf") or "").lower():
-            raise AssertionError("CSRF Cookie 不应为 HttpOnly")
+        session_flags = cookie_flags(response, "zhiya_session")
+        csrf_flags = cookie_flags(response, "zhiya_csrf")
+        if not all(session_flags.values()):
+            raise AssertionError(f"会话 Cookie 属性不符：{session_flags}")
+        if not csrf_flags["secure"] or not csrf_flags["sameSiteLax"] or csrf_flags["httpOnly"]:
+            raise AssertionError(f"CSRF Cookie 属性不符：{csrf_flags}")
         self.account = account
         self.password = password
-        return f"account={account}", {"cookieFlags": {"session": session_detail, "csrf": csrf_detail}}
+        return f"account={account}", {"cookieFlags": {"session": session_flags, "csrf": csrf_flags}}
 
     def test_anonymous_protected(self) -> str:
         response = self.anon.get("/api/v1/child-profiles")
@@ -446,7 +452,7 @@ class Acceptance:
             raise AssertionError(f"翻页未生效：{session}")
         return f"currentPage={next_page}, revision={self.revision}"
 
-    def test_branch_choice(self) -> tuple[str, dict]:
+    def test_branch_choice(self) -> Warn:
         branches = [item for item in (self.story.get("branches") or [])
                     if item.get("reviewStatus") == "APPROVED"]
         if not branches:
@@ -472,8 +478,9 @@ class Acceptance:
             "clientEventId": f"p6-branch-stale-{uuid4().hex[:8]}",
         })
         expect(stale, 409, "SESSION_CONFLICT", "过期 revision 选分支")
-        return f"branchId={branch['branchId']}, currentPage={data['currentPage']}, revision=2", {
-            "branchId": branch["branchId"], "nextPage": data["currentPage"]}
+        return Warn("已验证单条审核分支、重放与过期修订冲突。AC-14 部分通过，"
+                    "待验证同一决策点两种不同后续、节点上限与无环约束。",
+                    {"branchId": branch["branchId"], "nextPage": data["currentPage"]})
 
     def test_cross_account_session(self) -> str:
         if self.b is None:
@@ -603,9 +610,9 @@ class Acceptance:
             "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0,
             "clientEventId": f"p6-voice-{uuid4().hex[:8]}"}), 201, label="语音用例开始会话")
         self.voice_session = sid
-        no_csrf = self.a.post("/api/v1/voice/syntheses",
-                              json={"readingSessionId": sid, "pageNumber": 1, "revision": 1})
-        expect(no_csrf, 403, "CSRF_INVALID", "语音合成缺 CSRF")
+        no_csrf = self.a.post("/api/v1/voice/transcriptions",
+                              files={"file": ("x.wav", b"RIFF", "audio/wav")})
+        expect(no_csrf, 403, "CSRF_INVALID", "语音上传缺 CSRF")
         return "匿名 401、缺 CSRF 403"
 
     def test_voice_validation(self) -> str:
@@ -619,7 +626,7 @@ class Acceptance:
                                json={"readingSessionId": sid, "pageNumber": 1, "revision": 1})
         if self.args.voice_live:
             if response.status_code == 503 and error_code(response) == "TTS_NOT_CONFIGURED":
-                return "TTS 未配置，503 TTS_NOT_CONFIGURED"
+                raise Blocked("真实语音合成未执行，服务返回 503 TTS_NOT_CONFIGURED")
             body = expect(response, 201, label="真实语音合成")
             if "audioUrl" not in body.get("data", {}):
                 raise AssertionError("合成响应缺少 audioUrl")
@@ -672,8 +679,11 @@ class Acceptance:
         response = self.anon.get("/openapi.json")
         body = expect(response, 200, label="OpenAPI")
         actual = set(body.get("paths", {}))
+        self.openapi_paths = actual
         missing = sorted(CONTRACT_PATHS - actual)
         extra = sorted(actual - CONTRACT_PATHS)
+        if not missing:
+            return f"全部 {len(CONTRACT_PATHS)} 个契约路径已注册", {"missingPaths": [], "extraPaths": extra}
         return Warn(f"契约路径 {len(CONTRACT_PATHS)} 个，已实现 {len(CONTRACT_PATHS & actual)} 个；"
                     f"未实现 {len(missing)} 个", {"missingPaths": missing, "extraPaths": extra})
 
@@ -695,7 +705,8 @@ class Acceptance:
             raise AssertionError("仅公网 profile 执行")
         if not self.args.base_url.startswith("https://"):
             raise AssertionError("公网地址不是 HTTPS")
-        # ApiSession 已在 verify=True 下成功完成健康检查，说明证书链可用
+        if self.args.insecure_tls:
+            raise Blocked("证书校验已关闭，无法验收公网 TLS")
         response = self.anon.get("/api/v1/health")
         expect(response, 200, label="HTTPS 健康检查")
         hsts = response.headers.get("strict-transport-security")
@@ -722,7 +733,13 @@ class Acceptance:
 
     def run(self) -> int:
         args = self.args
-        self.rec.case("TC-P6-ENV-001", "测试环境与协议检查", "NFR-02", self.test_environment)
+        environment = self.rec.case("TC-P6-ENV-001", "测试环境与协议检查", "NFR-02", self.test_environment)
+        if environment.status != PASS:
+            return self._finish()
+        if args.profile == "public" and args.insecure_tls:
+            self.rec.case("TC-P6-PUB-001", "公网 HTTPS 与证书", "AC-11", self.test_public_tls)
+            self._finish()
+            return 2
         self.rec.case("TC-P6-API-001", "健康检查与 requestId", "NFR-08", self.test_health)
         self.rec.case("TC-P6-API-002", "未知路由错误结构", "FR-12", self.test_unknown_route)
         self.rec.case("TC-P6-API-003", "方法不允许错误结构", "FR-12", self.test_method_not_allowed)
@@ -824,16 +841,24 @@ class Acceptance:
             self.rec.record("TC-P6-PUB-002", "HTTP 强制跳转 HTTPS", "AC-11", BLOCKED,
                             "本轮为本地 profile")
 
-        # 已知未实现能力的显式记录，避免把“未测”写成“通过”
+        # 契约可能比验收驱动更新，以本轮路径观测区分缺失与功能未测。
+        paths = getattr(self, "openapi_paths", None)
+
+        def pending(*routes: str) -> str:
+            if paths is None:
+                return "未取得本轮 OpenAPI，功能用例尚未执行"
+            missing = [route for route in routes if route not in paths]
+            return "本轮契约路径缺失：" + "、".join(missing) if missing else "路由已注册，本轮未执行功能用例"
+
         for case_id, title, ac, reason in (
                 ("TC-P6-AGENT-001", "情境提问 API-016 与适龄问题", "AC-05",
-                 "API-016 尚未实现（契约路径缺失）"),
+                 pending("/api/v1/reading-sessions/{session_id}/questions")),
                 ("TC-P6-AGENT-002", "自适应引导 API-017 两种分支", "AC-06",
-                 "API-017 尚未实现（契约路径缺失）"),
+                 pending("/api/v1/reading-sessions/{session_id}/guidance")),
                 ("TC-P6-AGENT-003", "原创故事生成与审核 AC-13/15", "AC-13",
-                 "API-025/026 尚未实现"),
+                 pending("/api/v1/story-generations", "/api/v1/story-versions/{version_id}/approvals")),
                 ("TC-P6-ACT-001", "亲子活动材料与步骤 AC-09", "AC-09",
-                 "当前 activities 固定为空数组"),
+                 "本轮未验收活动材料与步骤"),
         ):
             self.rec.record(case_id, title, ac, BLOCKED, reason)
 
@@ -865,7 +890,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--profile", choices=["local", "public"], default="local")
     parser.add_argument("--account", help="已有演示账号；不传则自动注册")
-    parser.add_argument("--password", default="P6-test-pass-2026")
+    parser.add_argument("--password", default=os.environ.get("P6_ACCEPTANCE_PASSWORD", "P6-test-pass-2026"))
     parser.add_argument("--account-b", help="第二账号；不传则自动注册")
     parser.add_argument("--password-b", default="P6-test-pass-2026")
     parser.add_argument("--story-version-id", type=int)
@@ -873,12 +898,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=20.0)
     parser.add_argument("--performance-ms", type=float, default=3000.0)
     parser.add_argument("--outdir", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--tested-commit", help="被测服务的 Git 提交")
     parser.add_argument("--frontend-url")
     parser.add_argument("--http-url", help="公网 HTTP 入口，用于检查是否强制跳转 HTTPS")
     parser.add_argument("--allow-http", action="store_true", help="允许本地 HTTP 回传 Secure Cookie")
     parser.add_argument("--insecure-tls", action="store_true", help="跳过 TLS 证书校验（仅自签名测试）")
-    parser.add_argument("--voice-live", action="store_true", help="允许真实 TTS 合成（可能产生费用）")
-    parser.add_argument("--voice-expect-unconfigured", action="store_true",
+    voice = parser.add_mutually_exclusive_group()
+    voice.add_argument("--voice-live", action="store_true", help="允许真实 TTS 合成（可能产生费用）")
+    voice.add_argument("--voice-expect-unconfigured", action="store_true",
                         help="确认环境未配置 TTS，调用一次并断言 503（不产生费用）")
     parser.add_argument("--list", action="store_true", help="只列出用例编号并退出")
     return parser.parse_args(argv)
@@ -901,7 +928,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.base_url.startswith(("http://", "https://")):
         print("base-url 必须以 http:// 或 https:// 开头", file=sys.stderr)
         return 2
-    return Acceptance(args).run()
+    acceptance = Acceptance(args)
+    try:
+        return acceptance.run()
+    finally:
+        for client in (acceptance.a, acceptance.b, acceptance.anon):
+            if client is not None:
+                client.close()
 
 
 if __name__ == "__main__":

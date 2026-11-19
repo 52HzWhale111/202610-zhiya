@@ -20,7 +20,7 @@ python -m venv .venv
 ```
 
 首次运行会创建数据库、审核发布 12 本种子绘本与 20 条知识、创建演示账号
-`p6demo / Zhiya-demo-2026`。数据库默认位于 `database/instance/zhiya.sqlite3`，
+`p6demo / Zhiya-demo-2026`。数据库默认位于 `qa/p6/instance/zhiya.sqlite3`。脚本只发布与仓库种子逐项一致的候选绘本、页面和知识，
 也可用 `--db` 指定到仓库外，避免提交数据库文件。
 
 ## 分步执行
@@ -54,11 +54,11 @@ python qa/p6/run_acceptance.py \
   --base-url https://your-domain.example \
   --http-url http://your-domain.example \
   --profile public \
-  --account p6demo --password '演示账号密码' \
+  --account p6demo \
   --frontend-url https://your-domain.example
 ```
 
-公网模式要求 HTTPS；脚本会检查证书链、HTTP→HTTPS 跳转、HSTS、Cookie 的
+已有账号的密码可通过环境变量 `P6_ACCEPTANCE_PASSWORD` 传入。外部部署可用 `--tested-commit` 记录实际版本。公网模式要求启用证书校验的 HTTPS；脚本会检查证书链、HTTP→HTTPS 跳转、HSTS、Cookie 的
 `Secure/HttpOnly/SameSite` 属性、演示账号主流程与响应时间。`--frontend-url`
 用于检查前端页面是否可访问；未提供时前端验收记为 BLOCKED，不会写成通过。前端代码另有 71 项 Vitest，可通过 `npm --prefix frontend test` 执行。
 
@@ -78,7 +78,7 @@ python qa/p6/summarize_model_compare.py
 默认条件为 `baseline,domain`（通用模型 vs 领域条件）。如需消融实验，加
 `--conditions baseline,page_only,domain`。每次调用都会计费，脚本默认最多 48 次，
 超过需显式调高 `--max-calls`。结果写入 `reports/model-compare/results-*.jsonl`，
-两位评分人独立填写 `scoring.csv` 后再汇总；空表不会被算成通过。
+同一计划重跑会保留 `scoring.csv` 的评分和备注，换计划请指定新目录。任一有效评分计入已评分行；两种条件均收齐两位评分人的全部维度，才按两人等权计算配对胜平负。
 
 ## 产物
 
@@ -93,10 +93,10 @@ python qa/p6/summarize_model_compare.py
 
 ## 边界与注意
 
+- `run_p6.py --outdir <目录>` 将黑盒报告、缺陷台账和模型子目录写入同一轮输出。
+- `python qa/p6/build_test_doc.py` 根据同一份验收 JSON 生成报告正文、封面版本和交付摘要。自定义报告可用 `--acceptance <JSON> --markdown <新路径>` 单独导出。
 - 黑盒脚本不导入后端代码，不读取 `.env`，不接触真实密钥。
-- 语音用例默认只验证鉴权、CSRF 和格式，不调用合成；本地一键脚本在未检测到
-  `TTS_API_URL` / `DASHSCOPE_API_KEY` 时会加 `--voice-expect-unconfigured`，
-  调用一次并断言 503（不产生费用）。只有 `--voice-live` 才执行真实 TTS，可能计费。
+- 一键入口和演示默认跳过已鉴权的有效合成请求。明确确认被测服务禁用 TTS 后，传 `--voice-expect-unconfigured` 验证 503；真实语音使用 `--voice-live`（演示为 `--voice`），遇 503 不能判为真实合成通过。
 - 登录限流为同一 IP 15 分钟 10 次；连续多次执行验收会触发 429，属于预期安全行为。
   等待窗口结束、重启本地服务或更换出口 IP 后重跑。
 - 儿童模式 API-020 会吊销当前设备的家长会话，脚本为此使用独立客户端；手工演示时
@@ -105,3 +105,11 @@ python qa/p6/summarize_model_compare.py
   不是接口故障。
 
 - Windows 系统代理可能接管本机 POST 请求并返回 422；测试程序默认 `trust_env=False`。如确需代理，设置 `ZHIYA_USE_ENV_PROXY=1`。
+
+## 处理 2026-11-18 的归档会话
+
+原始验收报告来自测试人员本机的临时 SQLite 库。两份修订归档只记录 Cookie 属性。旧提交中的会话有效期为登录后 24 小时。在生成报告的机器上可执行下列命令，向原数据库撤销该条测试会话；已过期或已撤销时不会更新任何行。命令只输出状态。
+
+```bash
+git show f195a60:qa/p6/reports/acceptance-latest.json | python qa/p6/revoke_archived_session.py --db <原验收数据库路径>
+```

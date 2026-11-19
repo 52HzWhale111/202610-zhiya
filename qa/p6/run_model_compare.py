@@ -31,7 +31,7 @@ if str(BACKEND) not in sys.path:
 
 DEFAULT_CASES = Path(__file__).with_name("model_cases.json")
 DEFAULT_OUT = ROOT / "qa" / "p6" / "reports" / "model-compare"
-DEFAULT_DB = ROOT / "database" / "instance" / "zhiya.sqlite3"
+DEFAULT_DB = Path(__file__).resolve().parent / "instance" / "zhiya.sqlite3"
 
 BASELINE_SYSTEM = "你是一个通用AI助手。请直接、简洁地回答用户的问题。"
 PAGE_ONLY_SYSTEM = "你是一个通用AI助手。请只依据给出的页面内容回答问题，不要编造。"
@@ -164,7 +164,19 @@ def scoring_template(cases: list[dict], conditions: list[str], outdir: Path, dim
         for dimension in dimensions:
             columns.append(f"{rater}_{dimension}")
     columns += ["rater1_note", "rater2_note"]
-    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+    wanted = [(case["caseId"], condition) for case in cases for condition in conditions]
+    try:
+        new_file = path.open("x", newline="", encoding="utf-8-sig")
+    except FileExistsError:
+        with path.open(newline="", encoding="utf-8-sig") as existing:
+            reader = csv.DictReader(existing)
+            if reader.fieldnames != columns:
+                raise SystemExit("现有评分表列与本次计划不同，请为新计划指定独立 --outdir")
+            rows = [(row["caseId"], row["condition"]) for row in reader]
+            if sorted(rows) != sorted(wanted):
+                raise SystemExit("现有评分表与本次计划不同，请为新计划指定独立 --outdir")
+        return path
+    with new_file as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
         for case in cases:
@@ -184,6 +196,11 @@ def write_plan(cases: list[dict], conditions: list[str], outdir: Path, dimension
         "cases": cases,
     }
     plan_path = outdir / "model-compare-plan.json"
+    if plan_path.exists():
+        previous = json.loads(plan_path.read_text(encoding="utf-8"))
+        if any(previous.get(key) != plan[key] for key in ("cases", "conditions", "dimensions")):
+            raise SystemExit("评测内容已经改变，请为新计划指定独立 --outdir")
+    scoring = scoring_template(cases, conditions, outdir, dimensions)
     plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     guide = outdir / "scoring-guide.md"
     guide.write_text(
@@ -200,7 +217,6 @@ def write_plan(cases: list[dict], conditions: list[str], outdir: Path, dimension
         "汇总脚本会报告均分、配对胜/平/负与评分一致性。\n",
         encoding="utf-8",
     )
-    scoring = scoring_template(cases, conditions, outdir, dimensions)
     return {"plan": plan_path, "guide": guide, "scoring": scoring}
 
 

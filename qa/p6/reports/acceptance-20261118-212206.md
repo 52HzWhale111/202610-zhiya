@@ -2,6 +2,7 @@
 
 - 开始时间：2026-11-18T13:22:03Z
 - 结束时间：2026-11-18T13:22:06Z
+- 被测提交：ead1debaaf1eb5eb14e1a79503371667d790c4c1
 - 被测地址：http://127.0.0.1:8000
 - 测试环境：local
 
@@ -9,11 +10,11 @@
 
 | 状态 | 数量 |
 | --- | ---: |
-| PASS | 32 |
+| PASS | 31 |
 | FAIL | 0 |
 | BLOCKED | 6 |
 | SKIP | 0 |
-| WARN | 3 |
+| WARN | 4 |
 
 合计 41 项。
 
@@ -43,7 +44,7 @@
 | TC-P6-SESS-002 | AC-08 | 开始阅读、幂等与冲突 | PASS | 33 | STARTED=201、重放=200、同键不同体=409、过期 revision=409 |
 | TC-P6-SESS-003 | AC-04 | 翻页与进度持久化 | PASS | 17 | currentPage=2, revision=2 |
 | TC-P6-SESS-004 | NFR-04 | 跨账号会话隔离 | PASS | 5 | 跨账号读取/列表均不可见 |
-| TC-P6-BRANCH-001 | AC-14 | 受控故事分支选择 | PASS | 51 | branchId=1, currentPage=2, revision=2 |
+| TC-P6-BRANCH-001 | AC-14 | 受控故事分支选择 | WARN | 51 | branchId=1, currentPage=2, revision=2。仅验证一条审核分支及其重放、过期修订冲突。同一决策点两种不同后续、节点上限及无环约束尚未验收。 |
 | TC-P6-SESS-005 | AC-08 | 结束阅读与小结 | PASS | 12 | status=PENDING, activities=0（模型未配置或生成失败，记警告） |
 | TC-P6-SESS-006 | AC-08 | 阅读历史可查询 | PASS | 14 | 历史列表与详情均可查询，状态 FINISHED |
 | TC-P6-SESS-007 | AC-10 | 结束后禁止继续写入 | PASS | 11 | 结束后新事件 409 |
@@ -80,7 +81,7 @@
 | AC-11 | 0 | 0 | 2 | 0 | 0 |
 | AC-12 | 1 | 0 | 0 | 0 | 0 |
 | AC-13 | 0 | 0 | 1 | 0 | 0 |
-| AC-14 | 1 | 0 | 0 | 0 | 0 |
+| AC-14 | 0 | 0 | 0 | 0 | 1 |
 | FR-09 | 0 | 0 | 0 | 0 | 1 |
 | FR-12 | 2 | 0 | 0 | 0 | 0 |
 | FR-14 | 1 | 0 | 0 | 0 | 0 |

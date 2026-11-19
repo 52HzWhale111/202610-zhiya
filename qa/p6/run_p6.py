@@ -19,12 +19,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
-DEFAULT_DB = ROOT / "database" / "instance" / "zhiya.sqlite3"
+DEFAULT_DB = HERE / "instance" / "zhiya.sqlite3"
 DEFAULT_OUT = ROOT / "qa" / "p6" / "reports"
 
 
 def run(cmd: list[str], *, env: dict[str, str] | None = None) -> int:
-    print("$ " + " ".join(cmd))
+    print(f"运行 {Path(cmd[1]).name}", flush=True)
     completed = subprocess.run(cmd, cwd=ROOT, env=env)
     return completed.returncode
 
@@ -50,7 +50,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--outdir", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--account")
-    parser.add_argument("--password", default="P6-test-pass-2026")
+    parser.add_argument("--password", default=os.environ.get("P6_ACCEPTANCE_PASSWORD", "P6-test-pass-2026"))
+    parser.add_argument("--tested-commit", help="被测服务的 Git 提交，外部部署请显式提供")
+    voice = parser.add_mutually_exclusive_group()
+    voice.add_argument("--voice-live", action="store_true", help="明确执行真实 TTS")
+    voice.add_argument("--voice-expect-unconfigured", action="store_true", help="已确认目标服务禁用 TTS，验证 503")
     parser.add_argument("--frontend-url", help="前端地址，例如 http://127.0.0.1:5174")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--skip-prepare", action="store_true")
@@ -59,6 +63,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-defects", action="store_true")
     args = parser.parse_args(argv)
 
+    args.outdir = args.outdir.resolve()
+    args.db = args.db.resolve()
     base_url = args.base_url
     profile = args.profile or ("public" if base_url and base_url.startswith("https://") else "local")
     server: subprocess.Popen | None = None
@@ -73,8 +79,11 @@ def main(argv: list[str] | None = None) -> int:
                 if code:
                     return code
             else:
-                print(f"数据库已存在：{args.db}（如需重新发布种子，删除后重跑或手动运行 prepare_demo_data.py）")
+                print(f"数据库已存在：{args.db}（补充未发布的种子可手动运行 prepare_demo_data.py）")
         env["ZHIYA_DB_PATH"] = str(args.db.resolve())
+        if not args.voice_live:
+            env["DASHSCOPE_API_KEY"] = ""
+            env["TTS_API_URL"] = ""
         print(f"启动本地服务：{base_url}")
         server = subprocess.Popen(
             [args.python, "-m", "uvicorn", "app.main:create_app", "--factory",
@@ -93,20 +102,34 @@ def main(argv: list[str] | None = None) -> int:
                    "--profile", profile, "--outdir", str(args.outdir)]
             if profile == "local":
                 cmd.append("--allow-http")
-                if not os.getenv("TTS_API_URL") and not os.getenv("DASHSCOPE_API_KEY"):
-                    # 本地默认没有语音配置；显式断言 503，避免把“未调用”写成通过。
-                    cmd.append("--voice-expect-unconfigured")
+            if args.voice_live:
+                cmd.append("--voice-live")
+            elif args.voice_expect_unconfigured:
+                cmd.append("--voice-expect-unconfigured")
             if args.account:
-                cmd += ["--account", args.account, "--password", args.password]
+                cmd += ["--account", args.account]
+                env["P6_ACCEPTANCE_PASSWORD"] = args.password
+            tested_commit = args.tested_commit
+            if not tested_commit and server is not None:
+                git = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True)
+                if git.returncode == 0:
+                    tested_commit = git.stdout.strip()
+            if tested_commit:
+                cmd += ["--tested-commit", tested_commit]
             if args.frontend_url:
                 cmd += ["--frontend-url", args.frontend_url]
             code = run(cmd, env=env)
 
         if not args.skip_model:
-            run([args.python, str(HERE / "run_model_compare.py")], env=env)
-            run([args.python, str(HERE / "summarize_model_compare.py")], env=env)
+            model_out = str(args.outdir / "model-compare")
+            model_code = run([args.python, str(HERE / "run_model_compare.py"), "--outdir", model_out], env=env)
+            if not model_code:
+                model_code = run([args.python, str(HERE / "summarize_model_compare.py"), "--outdir", model_out], env=env)
+            code = code or model_code
         if not args.skip_defects:
-            run([args.python, str(HERE / "track_defects.py"), "--outdir", str(args.outdir)], env=env)
+            defects_code = run([args.python, str(HERE / "track_defects.py"), "--outdir", str(args.outdir),
+                                "--acceptance", str(args.outdir / "acceptance-latest.json")], env=env)
+            code = code or defects_code
     finally:
         if server is not None:
             server.terminate()

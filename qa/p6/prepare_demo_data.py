@@ -25,10 +25,11 @@ if str(BACKEND) not in sys.path:
 
 from app.api.v1.auth import password_hash  # noqa: E402
 
+sys.path.insert(0, str(ROOT / "database"))
+from import_seed import SEED_DIR, import_seed, load_seed  # noqa: E402
+
 SCHEMA = ROOT / "database" / "schema.sql"
-INIT = ROOT / "database" / "init_db.py"
-IMPORT = ROOT / "database" / "import_seed.py"
-DEFAULT_DB = ROOT / "database" / "instance" / "zhiya.sqlite3"
+DEFAULT_DB = Path(__file__).resolve().parent / "instance" / "zhiya.sqlite3"
 DEFAULT_ACCOUNT = "p6demo"
 DEFAULT_PASSWORD = "Zhiya-demo-2026"
 
@@ -48,8 +49,6 @@ def ensure_database(path: Path) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(connect(path, create=True)) as db, db:
         db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA.read_text(encoding="utf-8"))
-    sys.path.insert(0, str(ROOT / "database"))
-    from import_seed import import_seed  # noqa: WPS433 - 只在需要时导入
     import_seed(path)
     return True
 
@@ -80,37 +79,47 @@ def ensure_branch(db: sqlite3.Connection, version_id: int) -> None:
         return
     db.execute(
         """INSERT INTO story_branches (version_id, from_page_no, next_page_no, choice_label, review_status)
-           VALUES (?, 1, 2, 'P6测试分支', 'APPROVED')""",
+           VALUES (?, 1, 2, 'P6测试分支', 'APPROVED')
+           ON CONFLICT(version_id, from_page_no, choice_label) DO NOTHING""",
         (version_id,),
     )
 
 
+def matches_seed(db: sqlite3.Connection, table: str, record: dict) -> bool:
+    # 导入时间由数据库填写，修改过的正文须重新审核。
+    fields = {key: value for key, value in record.items() if key != "created_at"}
+    where = " AND ".join(f"{key} IS ?" for key in fields)
+    return db.execute(f"SELECT 1 FROM {table} WHERE {where}", tuple(fields.values())).fetchone() is not None
+
+
 def approve_content(db: sqlite3.Connection, reviewer_id: int, limit: int | None) -> dict:
-    now = int(time.time() * 1000)
-    versions = db.execute(
-        """SELECT v.id, v.title, v.age_min, v.age_max, b.source_type
-           FROM story_versions v JOIN storybooks b ON b.id = v.storybook_id
-           WHERE v.status = 'DRAFT' ORDER BY v.id"""
-    ).fetchall()
-    if limit is not None:
-        versions = versions[:limit]
+    seed = load_seed(SEED_DIR)
+    books = {row["id"]: row for row in seed["storybooks"]}
     approved = []
-    for row in versions:
-        if row["source_type"] != "LIBRARY":
+    now = int(time.time() * 1000)
+    for version in seed["story_versions"][:limit]:
+        version_id = version["id"]
+        book = books[version["storybook_id"]]
+        if book["source_type"] != "LIBRARY" or not matches_seed(db, "storybooks", book):
             continue
-        db.execute(
-            """UPDATE story_versions SET status = 'PUBLISHED', reviewed_by_id = ?, reviewed_at = ?
-               WHERE id = ? AND status = 'DRAFT'""",
-            (reviewer_id, now, row["id"]),
-        )
-        approved.append({"storyVersionId": row["id"], "title": row["title"],
-                         "ageMin": row["age_min"], "ageMax": row["age_max"]})
-        ensure_branch(db, row["id"])
-    knowledge = db.execute(
-        "UPDATE knowledge_items SET status = 'APPROVED', reviewed_at = ? WHERE status = 'DRAFT'",
-        (now,),
-    ).rowcount
-    db.commit()
+        if not matches_seed(db, "story_versions", version):
+            continue
+        pages = [row for row in seed["story_pages"] if row["version_id"] == version_id]
+        count = db.execute("SELECT COUNT(*) FROM story_pages WHERE version_id=?", (version_id,)).fetchone()[0]
+        if count != len(pages) or not all(matches_seed(db, "story_pages", page) for page in pages):
+            continue
+        db.execute("UPDATE story_versions SET status='PUBLISHED', reviewed_by_id=?, reviewed_at=? WHERE id=?",
+                   (reviewer_id, now, version_id))
+        ensure_branch(db, version_id)
+        approved.append({"storyVersionId": version_id, "title": version["title"],
+                         "ageMin": version["age_min"], "ageMax": version["age_max"]})
+    knowledge = 0
+    for item in seed["knowledge_items"]:
+        if matches_seed(db, "knowledge_items", item):
+            knowledge += db.execute(
+                "UPDATE knowledge_items SET status='APPROVED', reviewed_at=? WHERE item_key=? AND version_no=? AND status='DRAFT'",
+                (now, item["item_key"], item["version_no"]),
+            ).rowcount
     return {"storyVersions": approved, "knowledgeApproved": knowledge}
 
 
@@ -158,6 +167,8 @@ def main() -> int:
     parser.add_argument("--check-only", action="store_true", help="只查看当前数据库状态")
     args = parser.parse_args()
 
+    if args.limit < 0:
+        parser.error("--limit 必须大于等于 0")
     path = args.db.resolve()
     if not path.exists() and not args.yes:
         print(json.dumps({"error": "数据库不存在；首次准备请加 --yes",
@@ -173,6 +184,7 @@ def main() -> int:
 
     created = ensure_database(path)
     with closing(connect(path)) as db, db:
+        db.execute("BEGIN IMMEDIATE")
         admin_id = ensure_account(db, f"{args.account}-admin", args.password, "ADMIN")
         guardian_id = ensure_account(db, args.account, args.password, "GUARDIAN")
         approved = approve_content(db, admin_id, args.limit or None)
@@ -183,7 +195,6 @@ def main() -> int:
         "path": str(path),
         "databaseCreated": created,
         "demoAccount": args.account,
-        "demoPassword": args.password,
         "guardianId": guardian_id,
         "profile": profile,
         "publishedCount": len(story_ids),
