@@ -450,24 +450,43 @@ class Acceptance:
                     if item.get("reviewStatus") == "APPROVED"]
         if not branches:
             raise Blocked("当前绘本没有已审核分支；请运行 prepare_demo_data.py 准备测试分支")
-        branch = branches[0]
+        pages = {page["pageNumber"]: page.get("defaultNextPageNumber") for page in self.story["pages"]}
+        by_page = {}
+        for branch in branches:
+            by_page.setdefault(branch["fromPageNumber"], branch)
+        page = 1
+        route = []
+        visited = set()
+        while page in pages and page not in visited:
+            if page in by_page:
+                break
+            visited.add(page)
+            page = pages[page]
+            route.append(page)
+        else:
+            raise Blocked("沿绘本默认翻页路径无法到达已审核分支")
+        branch = by_page[page]
         session = self._create_session()
         sid = session["readingSessionId"]
-        expect(self.a.post(f"/api/v1/reading-sessions/{sid}/events", csrf=True, json={
-            "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0,
-            "clientEventId": f"p6-branch-start-{uuid4().hex[:8]}",
-        }), 201, label="分支用例开始会话")
-        payload = {"branchId": branch["branchId"], "expectedRevision": 1,
+        revision = session["revision"]
+        events = f"/api/v1/reading-sessions/{sid}/events"
+        for page_no in [1, *route]:
+            event = {"eventType": "STARTED" if page_no == 1 else "PAGE_CHANGED",
+                     "pageNumber": page_no, "expectedRevision": revision,
+                     "clientEventId": f"p6-branch-page-{uuid4().hex}"}
+            body = expect(self.a.post(events, csrf=True, json=event), 201, label=f"分支用例进入第 {page_no} 页")
+            revision = body["data"]["revision"]
+        payload = {"branchId": branch["branchId"], "expectedRevision": revision,
                    "clientEventId": f"p6-branch-{uuid4().hex[:8]}"}
         response = self.a.post(f"/api/v1/reading-sessions/{sid}/branches", csrf=True, json=payload)
         body = expect(response, 201, label="选择分支")
         data = body["data"]
-        if data.get("currentPage") != branch["nextPageNumber"] or data.get("revision") != 2:
+        if data.get("currentPage") != branch["nextPageNumber"] or data.get("revision") != revision + 1:
             raise AssertionError(f"分支结果不正确：{data}")
         replay = self.a.post(f"/api/v1/reading-sessions/{sid}/branches", csrf=True, json=payload)
         expect(replay, 200, label="分支重放")
         stale = self.a.post(f"/api/v1/reading-sessions/{sid}/branches", csrf=True, json={
-            "branchId": branch["branchId"], "expectedRevision": 1,
+            "branchId": branch["branchId"], "expectedRevision": revision,
             "clientEventId": f"p6-branch-stale-{uuid4().hex[:8]}",
         })
         expect(stale, 409, "SESSION_CONFLICT", "过期 revision 选分支")

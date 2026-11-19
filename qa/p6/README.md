@@ -21,7 +21,7 @@ python -m venv .venv
 
 首次运行会创建数据库、审核发布 12 本种子绘本与 20 条知识、创建演示账号
 `p6demo / Zhiya-demo-2026`。数据库默认位于 `qa/p6/instance/zhiya.sqlite3`。脚本只发布与仓库种子逐项一致的候选绘本、页面和知识，
-也可用 `--db` 指定到仓库外，避免提交数据库文件。
+也可用 `--db` 指定到仓库外，避免提交数据库文件。一键入口会继续完成自己上次中断的准备事务。对没有准备标记、只有草稿种子且没有账号的旧库，请先确认用途，再执行 `python qa/p6/prepare_demo_data.py --db <数据库路径> --yes`。
 
 ## 分步执行
 
@@ -97,7 +97,7 @@ python qa/p6/summarize_model_compare.py
 
 ## 边界与注意
 
-- `run_p6.py --outdir <目录>` 将黑盒报告、缺陷台账和模型子目录写入同一轮输出。
+- `run_p6.py --outdir <目录>` 将黑盒报告、缺陷台账和模型子目录写入同一轮输出。多轮共用目录时，先读 `acceptance-latest.json` 中的 `meta.runId`，再按 `acceptance-<runId>.json/.md/.xml` 获取同轮的三份归档。
 - 导出 Word 时，先在运行报告脚本的同一虚拟环境执行 `python -m pip install -r qa/p6/requirements-docs.txt`。仅导出 Markdown 可跳过此依赖。
 - `python qa/p6/build_test_doc.py --acceptance <JSON>` 在该 JSON 旁的 `retests/` 下生成本轮 Markdown 和 Word 报告，文件名包含输入指纹，日期和提交取自运行记录。可用 `--markdown <新路径>`、`--docx <新路径>` 指定输出，或用 `--no-docx` 仅生成 Markdown。11 月 18 日交付的文档、演示脚本及 PDF 保留原版。
 - 黑盒脚本不导入后端代码，不读取 `.env`，不接触真实密钥。

@@ -5,7 +5,9 @@ import csv
 import json
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
+from threading import Event
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import httpx
@@ -304,3 +306,101 @@ def test_same_second_keeps_each_acceptance_archive(tmp_path, monkeypatch):
     for p in archived:
         assert p.with_suffix(".md").exists() and p.with_suffix(".xml").exists()
     assert json.loads((tmp_path / "acceptance-latest.json").read_text("utf-8"))["meta"]["testedCommit"] == "B"
+
+
+def test_one_click_resumes_after_seed_commit(tmp_path, monkeypatch):
+    path = tmp_path / "demo.sqlite3"
+    monkeypatch.setattr("sys.argv", ["prepare", "--db", str(path), "--yes", "--if-empty"])
+    with monkeypatch.context() as fault:
+        fault.setattr(prepare_demo_data, "approve_content", Mock(side_effect=OSError("审核中断")))
+        with pytest.raises(OSError, match="审核中断"):
+            prepare_demo_data.main()
+    before = prepare_demo_data.check(path)
+    assert before["story_versions"] > 0 and before["accounts"] == before["publishedVersions"] == 0
+    assert prepare_demo_data.main() == 0
+    after = prepare_demo_data.check(path)
+    assert after["accounts"] == 2 and after["publishedVersions"] > 0 and after["child_profiles"] == 1
+    monkeypatch.setattr(prepare_demo_data, "approve_content", Mock(side_effect=AssertionError("重复发布")))
+    assert prepare_demo_data.main() == 0 and prepare_demo_data.check(path) == after
+
+
+def test_unmarked_seed_database_requires_explicit_preparation(tmp_path, monkeypatch):
+    path = tmp_path / "existing.sqlite3"
+    prepare_demo_data.ensure_database(path)
+    with closing(prepare_demo_data.connect(path)) as db, db:
+        db.execute("DROP TABLE p6_demo_setup_pending")
+    before = prepare_demo_data.check(path)
+    monkeypatch.setattr("sys.argv", ["prepare", "--db", str(path), "--yes", "--if-empty"])
+    assert prepare_demo_data.main() == 2 and prepare_demo_data.check(path) == before
+
+
+@pytest.mark.parametrize("value", [None, "", "  ", 7])
+def test_eval_id_required_before_any_provider_call(tmp_path, monkeypatch, value):
+    payload = json.loads(runner.DEFAULT_CASES.read_text("utf-8"))
+    case = payload["cases"][0]
+    if value is None:
+        del case["evalId"]
+    else:
+        case["evalId"] = value
+    source, out = tmp_path / "cases.json", tmp_path / "results"
+    source.write_text(json.dumps(payload), encoding="utf-8")
+    live = Mock(side_effect=AssertionError("不应启动模型"))
+    monkeypatch.setattr(runner, "run_live", live)
+    with pytest.raises(SystemExit, match=f"{case['caseId']}.*evalId"):
+        runner.main(["--cases", str(source), "--outdir", str(out), "--live"])
+    live.assert_not_called()
+    assert not out.exists()
+
+
+def test_branch_uses_reachable_page_and_observed_revision(acceptance):
+    acceptance.story = {"pages": [{"pageNumber": 1, "defaultNextPageNumber": 2}, {"pageNumber": 2}],
+                        "branches": [{"branchId": i, "fromPageNumber": page, "nextPageNumber": 3,
+                                      "reviewStatus": "APPROVED"} for i, page in [(10, 7), (11, 2)]]}
+    acceptance._create_session = Mock(return_value={"readingSessionId": 1, "revision": 0})
+    def response(status, data):
+        return httpx.Response(status, json={"data": data})
+    acceptance.a.post.side_effect = [response(201, {"revision": 1}), response(201, {"revision": 2}),
+                                     response(201, {"currentPage": 3, "revision": 3}), response(200, {}),
+                                     httpx.Response(409, json={"error": {"code": "SESSION_CONFLICT"}})]
+    outcome = acceptance.test_branch_choice()
+    posts = [call.kwargs["json"] for call in acceptance.a.post.call_args_list]
+    assert [event["pageNumber"] for event in posts[:2]] == [1, 2]
+    assert posts[1]["eventType"] == "PAGE_CHANGED"
+    assert [event["expectedRevision"] for event in posts] == [0, 1, 2, 2, 2]
+    assert outcome.evidence["branchId"] == 11
+    acceptance.story["branches"] = acceptance.story["branches"][:1]
+    acceptance.story["pages"][1]["defaultNextPageNumber"] = 1
+    with pytest.raises(common.Blocked, match="无法到达"):
+        acceptance.test_branch_choice()
+    acceptance._create_session.assert_called_once()
+
+
+def test_simultaneous_publications_keep_latest_pair_together(tmp_path, monkeypatch):
+    first = common.Recorder()
+    second = common.Recorder()
+    first.meta["testedCommit"], second.meta["testedCommit"] = "A", "B"
+    first_alias = Event()
+    second_finished = Event()
+    replace = Path.replace
+
+    def pause_first_writer(path, destination):
+        result = replace(path, destination)
+        if not first_alias.is_set():
+            first_alias.set()
+            second_finished.wait(1)
+        return result
+
+    monkeypatch.setattr(Path, "replace", pause_first_writer)
+    with ThreadPoolExecutor(2) as pool:
+        a = pool.submit(common.write_reports, first, tmp_path)
+        assert first_alias.wait(5)
+        b = pool.submit(common.write_reports, second, tmp_path)
+        try:
+            b.result(timeout=10)
+        finally:
+            second_finished.set()
+        a.result(timeout=10)
+    latest = json.loads((tmp_path / "acceptance-latest.json").read_text("utf-8"))
+    assert latest["meta"]["testedCommit"] == "B"
+    archived = tmp_path / f"acceptance-{latest['meta']['runId']}.md"
+    assert archived.read_bytes() == (tmp_path / "acceptance-latest.md").read_bytes()

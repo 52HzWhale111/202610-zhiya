@@ -65,6 +65,8 @@ def load_cases(path: Path) -> dict[str, Any]:
         if not case_id or case_id in seen:
             raise SystemExit(f"用例编号缺失或重复：{case_id}")
         seen.add(case_id)
+        if not isinstance(case.get("evalId"), str) or not case["evalId"].strip():
+            raise SystemExit(f"{case_id} 缺少有效的 evalId")
         for field in ("title", "task", "ageBand", "topics", "pageText", "userInput", "expected", "dimensions"):
             if field not in case:
                 raise SystemExit(f"{case_id} 缺少字段 {field}")

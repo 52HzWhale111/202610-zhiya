@@ -43,19 +43,21 @@ def connect(path: Path, *, create: bool = False) -> sqlite3.Connection:
 
 
 def ensure_database(path: Path) -> bool:
-    """初始化新库或恢复未完成种子导入的空库，返回本次是否进行了初始化。"""
-    if path.exists():
-        with closing(connect(path)) as db:
-            tables = {row[0] for row in db.execute(
-                "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*'")}
+    """在脚本认领的新库或空库中导入种子，保留标记直到演示数据事务提交。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(connect(path, create=True)) as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        tables = {row[0] for row in db.execute(
+            "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*'")}
+        if "p6_demo_setup_pending" not in tables:
             if tables and not {"accounts", "storybooks"}.issubset(tables):
                 return False
             for table in tables:
                 name = table.replace('"', '""')
                 if db.execute(f'SELECT 1 FROM "{name}" LIMIT 1').fetchone():
                     return False
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with closing(connect(path, create=True)) as db, db:
+            db.execute("CREATE TABLE p6_demo_setup_pending (id INTEGER PRIMARY KEY)")
+    with closing(connect(path)) as db, db:
         db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA.read_text(encoding="utf-8"))
     import_seed(path)
     return True
@@ -196,14 +198,26 @@ def main() -> int:
     existed = path.exists()
     initialized = ensure_database(path)
     if args.if_empty and not initialized:
+        with closing(connect(path)) as db:
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_schema WHERE type='table'")}
+            if {"accounts", "story_versions"} <= tables and db.execute(
+                    "SELECT NOT EXISTS(SELECT 1 FROM accounts) AND EXISTS(SELECT 1 FROM story_versions) "
+                    "AND NOT EXISTS(SELECT 1 FROM story_versions WHERE status='PUBLISHED')").fetchone()[0]:
+                print("已有种子库缺少演示账号和已发布绘本。确认它用于演示后，请用 --db 指定该库并加 --yes 单独准备。",
+                      file=sys.stderr)
+                return 2
         print(f"复用已有数据库：{path}")
         return 0
     with closing(connect(path)) as db, db:
         db.execute("BEGIN IMMEDIATE")
+        if args.if_empty and not db.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='p6_demo_setup_pending'").fetchone():
+            return 0  # 并发准备已由另一进程完成。
         admin_id = ensure_account(db, f"{args.account}-admin", args.password, "ADMIN")
         guardian_id = ensure_account(db, args.account, args.password, "GUARDIAN")
         approved = approve_content(db, admin_id, args.limit or None)
         profile = ensure_profile(db, guardian_id, args.nickname)
+        db.execute("DROP TABLE IF EXISTS p6_demo_setup_pending")
 
     story_ids = [item["storyVersionId"] for item in approved["storyVersions"]]
     result = {

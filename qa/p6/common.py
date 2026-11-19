@@ -9,9 +9,11 @@ import ipaddress
 import json
 import os
 import secrets
+import sqlite3
 import time
 import traceback
 import xml.etree.ElementTree as ET
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -284,7 +286,7 @@ def write_reports(recorder: Recorder, outdir: Path, *, title: str = "知芽 P6 �
     outdir.mkdir(parents=True, exist_ok=True)
     suffix = f"{stamp()}-{secrets.token_hex(16)}"
     summary = recorder.summary()
-    payload = {"title": title, "meta": {**recorder.meta, **summary}, "results": [r.to_dict() for r in recorder.results]}
+    payload = {"title": title, "meta": {**recorder.meta, **summary, "runId": suffix}, "results": [r.to_dict() for r in recorder.results]}
 
     json_path = outdir / f"acceptance-{suffix}.json"
     latest_json = outdir / "acceptance-latest.json"
@@ -294,6 +296,7 @@ def write_reports(recorder: Recorder, outdir: Path, *, title: str = "知芽 P6 �
     md_lines = [
         f"# {title}",
         "",
+        f"- 运行标识：{suffix}",
         f"- 开始时间：{recorder.meta.get('startedAt', '')}",
         f"- 结束时间：{summary['finishedAt']}",
         f"- 被测提交：{recorder.meta.get('testedCommit', '未记录')}",
@@ -347,14 +350,16 @@ def write_reports(recorder: Recorder, outdir: Path, *, title: str = "知芽 P6 �
     xml_path = outdir / f"acceptance-{suffix}.xml"
     ET.ElementTree(suite).write(xml_path, encoding="utf-8", xml_declaration=True)
 
-    # 三种归档写完才更新 latest。并发读取者始终获得完整的单个文件。
-    for target, content in ((latest_json, text), (latest_md, md_text)):
-        temporary = outdir / f".{suffix}-{target.name}.tmp"
-        try:
-            temporary.write_text(content, encoding="utf-8")
-            temporary.replace(target)
-        finally:
-            temporary.unlink(missing_ok=True)
+    # 用 SQLite 文件锁串行发布两个兼容入口。进程退出时锁随连接释放。
+    with closing(sqlite3.connect(outdir / ".p6-report-lock.sqlite3", timeout=30)) as lock, lock:
+        lock.execute("BEGIN IMMEDIATE")
+        for target, content in ((latest_md, md_text), (latest_json, text)):
+            temporary = outdir / f".{suffix}-{target.name}.tmp"
+            try:
+                temporary.write_text(content, encoding="utf-8")
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
 
     return {"json": json_path, "markdown": md_path, "junit": xml_path,
             "latestJson": latest_json, "latestMarkdown": latest_md}
