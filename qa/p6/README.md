@@ -47,6 +47,8 @@ python qa/p6/summarize_model_compare.py
 python qa/p6/track_defects.py
 ```
 
+只汇总人工缺陷时，运行 `python qa/p6/track_defects.py --manual-only`。
+
 ## 公网验收
 
 ```bash
@@ -92,7 +94,7 @@ python qa/p6/summarize_model_compare.py
 | `reports/acceptance-latest.md` | 用例明细与验收项汇总 |
 | `reports/acceptance-*.xml` | JUnit 格式，可接入 CI |
 | `reports/model-compare/` | 评测计划、评分模板、原始输出与汇总 |
-| `reports/defect-ledger.md/.csv` | 缺陷跟踪表 |
+| `reports/defect-ledger.md`、`reports/defect-ledger.csv` | 最近发布的缺陷台账。并发复测时，从 Markdown 末尾的两个链接获取同一轮的 Markdown 和 CSV 归档。 |
 | `docs/testing/p6/P6-测试文档.md` | 提交用测试文档 |
 
 ## 边界与注意

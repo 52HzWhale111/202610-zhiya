@@ -287,9 +287,10 @@ class Acceptance:
         if data["preferredMinutes"] != 15 or data["interests"] != ["动物"]:
             raise AssertionError(f"修改未持久化：{data}")
         reloaded = self.a.get("/api/v1/child-profiles")
-        row = next(item for item in reloaded.json()["data"]["items"]
+        listed = expect(reloaded, 200, label="重新读取档案")
+        row = next(item for item in listed["data"]["items"]
                    if item["childProfileId"] == profile["childProfileId"])
-        if row["preferredMinutes"] != 15:
+        if row.get("preferredMinutes") != 15 or row.get("interests") != ["动物"]:
             raise AssertionError("重新读取后修改丢失")
         return "preferredMinutes=15, interests=[动物]"
 
@@ -369,7 +370,8 @@ class Acceptance:
         if not items:
             raise AssertionError("推荐结果为空；请确认已审核发布绘本")
         for item in items:
-            if not item.get("storyVersionId") or not str(item.get("reason", "")).strip():
+            reason = item.get("reason")
+            if not item.get("storyVersionId") or not isinstance(reason, str) or not reason.strip():
                 raise AssertionError(f"推荐项缺少 storyVersionId 或 reason：{item}")
         if self.b is not None:
             cross = self.b.post("/api/v1/recommendations", csrf=True,
@@ -608,7 +610,10 @@ class Acceptance:
             if not child_token_before:
                 raise AssertionError("进入儿童模式后没有儿童 Cookie")
             # 儿童可读授权范围
-            expect(guardian.get("/api/v1/storybooks"), 200, label="儿童绘本列表")
+            listed = expect(guardian.get("/api/v1/storybooks"), 200, label="儿童绘本列表")
+            visible = [item["storyVersionId"] for item in listed["data"]["items"]]
+            if visible != [self.story["storyVersionId"]]:
+                raise AssertionError(f"儿童绘本列表与本轮授权范围不符：{visible}")
             expect(guardian.get(f"/api/v1/reading-sessions/{sid}"), 200, label="儿童会话详情")
             # 儿童不能改设置 / 看档案
             forbidden = guardian.put(f"/api/v1/reading-sessions/{sid}/mode-settings", csrf=True, json={
@@ -667,8 +672,9 @@ class Acceptance:
             if response.status_code == 503 and error_code(response) == "TTS_NOT_CONFIGURED":
                 raise Blocked("真实语音合成未执行，服务返回 503 TTS_NOT_CONFIGURED")
             body = expect(response, 201, label="真实语音合成")
-            if "audioUrl" not in body.get("data", {}):
-                raise AssertionError("合成响应缺少 audioUrl")
+            audio_url = body["data"].get("audioUrl")
+            if not isinstance(audio_url, str) or not audio_url.strip():
+                raise AssertionError("合成响应缺少有效的 audioUrl")
             return "真实合成成功（已产生一次供应商调用）"
         expect(response, 503, "TTS_NOT_CONFIGURED", "TTS 未配置")
         bad_type = self.a.post("/api/v1/voice/syntheses", csrf=True,
@@ -908,6 +914,8 @@ class Acceptance:
     def _finish(self, *, core_blocked: bool = False) -> int:
         summary = self.rec.summary()
         paths = write_reports(self.rec, self.args.outdir, title="知芽 P6 黑盒验收测试报告")
+        if self.args.report_path_file:
+            self.args.report_path_file.write_text(str(paths["json"].resolve()), encoding="utf-8")
         print("\n" + "=" * 60)
         print(f"合计 {summary['total']} 项：{summary['counts']}")
         for key, path in paths.items():
@@ -931,6 +939,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=20.0)
     parser.add_argument("--performance-ms", type=float, default=3000.0)
     parser.add_argument("--outdir", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--report-path-file", type=Path, help="将本轮归档 JSON 的路径写入指定文件")
     parser.add_argument("--tested-commit", help="被测服务的 Git 提交")
     parser.add_argument("--frontend-url")
     parser.add_argument("--http-url", help="公网 HTTP 入口，用于检查是否强制跳转 HTTPS")

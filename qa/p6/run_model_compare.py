@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -72,8 +73,16 @@ def load_cases(path: Path) -> dict[str, Any]:
                 raise SystemExit(f"{case_id} 缺少字段 {field}")
         if not 1 <= len(case["userInput"].strip()) <= 200:
             raise SystemExit(f"{case_id} userInput 必须为 1～200 字符")
-        if case["task"] == "CUSTOM" and not case.get("systemPrompt"):
-            raise SystemExit(f"{case_id} CUSTOM 用例缺少 systemPrompt")
+        task = case["task"]
+        if task == "CUSTOM":
+            custom_task = case.get("customTask")
+            if custom_task is not None and (not isinstance(custom_task, str) or custom_task not in CUSTOM_TASK_TYPES):
+                raise SystemExit(f"{case_id} 未知 customTask：{custom_task}")
+            prompt = case.get("systemPrompt")
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise SystemExit(f"{case_id} CUSTOM 用例缺少 systemPrompt")
+        elif not isinstance(task, str) or task not in G09_TASK_TYPES:
+            raise SystemExit(f"{case_id} 未知 task：{task}")
     return payload
 
 
@@ -223,20 +232,20 @@ async def run_live(args: argparse.Namespace, plan: dict, outdir: Path) -> int:
 
     try:
         base = Settings.from_env()
+        settings = replace(
+            base,
+            model_api_url=args.model_api_url or base.model_api_url,
+            model_name=args.model_name or base.model_name,
+            model_timeout_seconds=base.model_timeout_seconds if args.timeout is None else min(args.timeout, 20.0),
+            model_max_tokens=base.model_max_tokens if args.max_tokens is None else args.max_tokens,
+        )
     except ValueError as exc:
         print(f"配置错误：{exc}", file=sys.stderr)
         return 2
-    if not base.model_configured:
+    if not settings.model_configured:
         print("未设置 MODEL_API_KEY（或 MODEL_API_URL/MODEL_NAME 为空）。"
               "为避免把未配置写成模型失败，真实执行已中止。", file=sys.stderr)
         return 2
-    settings = Settings(
-        model_api_url=args.model_api_url or base.model_api_url,
-        model_api_key=base.model_api_key,
-        model_name=args.model_name or base.model_name,
-        model_timeout_seconds=min(args.timeout, 20.0),
-        model_max_tokens=args.max_tokens,
-    )
     cases, conditions = plan["cases"], plan["conditions"]
     budget = plan["callBudget"]
     if budget > args.max_calls:
@@ -325,8 +334,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--live", action="store_true", help="执行真实模型调用（会产生费用）")
     parser.add_argument("--model-name", help="覆盖 MODEL_NAME")
     parser.add_argument("--model-api-url", help="覆盖 MODEL_API_URL")
-    parser.add_argument("--timeout", type=float, default=20.0)
-    parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument("--timeout", type=float)
+    parser.add_argument("--max-tokens", type=int)
     parser.add_argument("--max-calls", type=int, default=48)
     parser.add_argument("--limit", type=int, help="只跑前 N 个案例（调试用）")
     args = parser.parse_args(argv)

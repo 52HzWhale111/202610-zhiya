@@ -9,17 +9,18 @@ import ipaddress
 import json
 import os
 import secrets
-import sqlite3
+import tempfile
 import time
 import traceback
 import xml.etree.ElementTree as ET
-from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 import httpx
+
+from report_files import publish_pair
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -350,16 +351,12 @@ def write_reports(recorder: Recorder, outdir: Path, *, title: str = "知芽 P6 �
     xml_path = outdir / f"acceptance-{suffix}.xml"
     ET.ElementTree(suite).write(xml_path, encoding="utf-8", xml_declaration=True)
 
-    # 用 SQLite 文件锁串行发布两个兼容入口。进程退出时锁随连接释放。
-    with closing(sqlite3.connect(outdir / ".p6-report-lock.sqlite3", timeout=30)) as lock, lock:
-        lock.execute("BEGIN IMMEDIATE")
-        for target, content in ((latest_md, md_text), (latest_json, text)):
-            temporary = outdir / f".{suffix}-{target.name}.tmp"
-            try:
-                temporary.write_text(content, encoding="utf-8")
-                temporary.replace(target)
-            finally:
-                temporary.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory(dir=outdir) as temporary:
+        staging = Path(temporary)
+        staged_md, staged_json = staging / latest_md.name, staging / latest_json.name
+        staged_md.write_text(md_text, encoding="utf-8")
+        staged_json.write_text(text, encoding="utf-8")
+        publish_pair(staged_md, staged_json, outdir)
 
     return {"json": json_path, "markdown": md_path, "junit": xml_path,
             "latestJson": latest_json, "latestMarkdown": latest_md}

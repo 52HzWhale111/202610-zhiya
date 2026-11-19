@@ -119,7 +119,12 @@ def test_voice_auth_checks_do_not_submit_synthesis(monkeypatch):
 
 
 def test_external_runner_does_not_guess_voice_or_print_password(tmp_path, monkeypatch, capsys):
-    child = Mock(return_value=type("Run", (), {"returncode": 0})())
+    def accept(argv, **kwargs):
+        archive = tmp_path / "acceptance-test.json"
+        archive.write_text("{}", "utf-8")
+        Path(argv[argv.index("--report-path-file") + 1]).write_text(str(archive), "utf-8")
+        return type("Run", (), {"returncode": 0})()
+    child = Mock(side_effect=accept)
     monkeypatch.setattr(run_p6.subprocess, "run", child)
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     assert run_p6.main(["--base-url", "http://127.0.0.1:8765", "--outdir", str(tmp_path),
@@ -259,7 +264,7 @@ def test_committed_archives_honestly_record_branch_scope_and_cookie_flags():
 
 
 
-def test_bound_scoring_sheet_preserves_each_run(tmp_path):
+def test_bound_scoring_sheet_preserves_each_run(tmp_path, capsys):
     assert run_model_compare.main(["--outdir", str(tmp_path), "--limit", "1"]) == 0
     plan = json.loads((tmp_path / "model-compare-plan.json").read_text("utf-8"))
     case_id = plan["cases"][0]["caseId"]
@@ -289,6 +294,30 @@ def test_bound_scoring_sheet_preserves_each_run(tmp_path):
     assert summarize_model_compare.main(first) == 0
     summary = tmp_path / "model-compare-summary.json"
     assert json.loads(summary.read_text("utf-8"))["paired"]["ties"] == 1
+    summary_files = {p: p.read_bytes() for p in tmp_path.glob("model-compare-summary.*")}
+    missing = "rater1_" + plan["dimensions"][0]
+    incomplete = tmp_path / "missing-column.csv"
+    with incomplete.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=[c for c in columns if c != missing], extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    assert summarize_model_compare.main([*first, "--scores", str(incomplete)]) == 2
+    assert missing in capsys.readouterr().err
+    assert all(p.read_bytes() == original for p, original in summary_files.items())
+    shifted = tmp_path / "extra-cell.csv"
+    with shifted.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(columns)
+        for line, row in enumerate(rows, start=2):
+            values = [row[col] for col in columns]
+            if row["condition"] == "domain":
+                values.insert(columns.index("outputExcerpt") + 1, "0")
+                bad_line = line
+            writer.writerow(values)
+    assert summarize_model_compare.main([*first, "--scores", str(shifted)]) == 2
+    error = capsys.readouterr().err
+    assert shifted.name in error and f"第 {bad_line} 行" in error
+    assert all(p.read_bytes() == original for p, original in summary_files.items())
     second = report("B")
     assert summarize_model_compare.main(second) == 0
     assert json.loads(summary.read_text("utf-8"))["scoredRows"] == 0
@@ -385,7 +414,7 @@ def test_pinned_story_never_falls_back_to_first_page():
 
 def test_defect_ids_identify_the_whole_case():
     cases = [case("TC-P6-API-001"), case("TC-P6-PROF-001")]
-    defects = track_defects.auto_defects({"results": cases}, track_defects.load_manual(track_defects.DEFAULT_MANUAL))
+    defects = track_defects.auto_defects({"results": cases})
     assert {d["id"] for d in defects} == {"DEF-P6-AUTO-API-001", "DEF-P6-AUTO-PROF-001"}
 
 

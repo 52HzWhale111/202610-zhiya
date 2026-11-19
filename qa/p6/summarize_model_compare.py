@@ -10,6 +10,7 @@ import csv
 import hashlib
 import json
 import os
+import sqlite3
 import statistics
 import sys
 import tempfile
@@ -17,6 +18,8 @@ from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any, TextIO
+
+from report_files import publish_pair
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUT = ROOT / "qa" / "p6" / "reports" / "model-compare"
@@ -38,25 +41,41 @@ def load_results(path: Path | None) -> list[dict[str, Any]]:
     return rows
 
 
+def grade_columns(dimensions: list[str]) -> list[str]:
+    return [f"{rater}_{dimension}" for rater in ("rater1", "rater2") for dimension in dimensions]
+
+
 def load_scores(path: Path, dimensions: list[str]) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
+    grades = grade_columns(dimensions)
+    required = ["outputKey", "caseId", "condition", *grades]
     rows = []
     with path.open(encoding="utf-8-sig", newline="") as handle:
-        for row in csv.DictReader(handle):
+        reader = csv.DictReader(handle)
+        headers = reader.fieldnames or []
+        missing = [key for key in required if key not in headers]
+        if missing:
+            raise ValueError(f"{path.name} 缺少评分表必需列：{', '.join(missing)}")
+        duplicates = [key for key in required if headers.count(key) > 1]
+        if duplicates:
+            raise ValueError(f"{path.name} 评分表必需列重复：{', '.join(duplicates)}")
+        for row in reader:
+            if None in row:
+                raise ValueError(f"{path.name} 第 {reader.line_num} 行的单元格数超过表头列数")
+            if any(row[key] is None for key in required):
+                raise ValueError(f"{path.name} 第 {reader.line_num} 行缺少必需单元格")
             parsed = dict(row)
-            for rater in ("rater1", "rater2"):
-                for dimension in dimensions:
-                    key = f"{rater}_{dimension}"
-                    raw = (row.get(key) or "").strip()
-                    parsed[key] = int(raw) if raw in {"0", "1", "2"} else None
+            for key in grades:
+                raw = row[key].strip()
+                if raw and raw not in {"0", "1", "2"}:
+                    raise ValueError(f"{path.name}：{row['caseId']} / {row['condition']} / {key}"
+                                     f" 评分 {raw!r} 无效，请填写 0、1、2 或留空")
+                parsed[key] = int(raw) if raw else None
             rows.append(parsed)
     return rows
 
 
 def scoring_columns(dimensions: list[str]) -> list[str]:
-    grades = [f"{rater}_{dimension}" for rater in ("rater1", "rater2") for dimension in dimensions]
-    return ["caseId", "condition", "model", "outputExcerpt", *grades, "rater1_note", "rater2_note"]
+    return ["caseId", "condition", "model", "outputExcerpt", *grade_columns(dimensions), "rater1_note", "rater2_note"]
 
 
 def plan_fingerprint(plan: dict) -> str:
@@ -353,22 +372,29 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     outputs = eligible_outputs(plan, results)
     scores_path = args.scores
-    if scores_path is None and outputs:
-        try:
+    try:
+        if scores_path is None and outputs:
             scores_path = score_sheet(outdir, results_path, outputs, dimensions)
-        except ValueError as exc:
-            print(exc, file=sys.stderr)
-            return 2
-    scores = load_scores(scores_path, dimensions) if scores_path else []
+        scores = load_scores(scores_path, dimensions) if scores_path else []
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
     summary = summarize(plan, results, scores, dimensions)
     outputs = export_outputs(results, outdir, results_path)
-    summary_path = outdir / "model-compare-summary.json"
-    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    markdown = write_markdown(summary, outdir, results_path, dimensions, scores_path)
+    try:
+        with tempfile.TemporaryDirectory(dir=outdir) as temporary:
+            staging = Path(temporary)
+            summary_path = staging / "model-compare-summary.json"
+            summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+            markdown = write_markdown(summary, staging, results_path, dimensions, scores_path)
+            publish_pair(summary_path, markdown, outdir)
+    except (OSError, sqlite3.Error) as exc:
+        print(f"无法发布模型汇总：{exc}", file=sys.stderr)
+        return 2
     if scores_path:
         print(f"本轮评分表：{scores_path}")
-    print(f"汇总：{markdown}")
-    print(f"JSON：{summary_path}")
+    print(f"汇总：{outdir / markdown.name}")
+    print(f"JSON：{outdir / summary_path.name}")
     if outputs:
         print(f"原始输出：{outputs}")
     print(f"结果 {len(results)} 条，已评分 {summary['scoredRows']} 行")

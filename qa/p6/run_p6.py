@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from http.client import HTTPException
@@ -123,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     code = 0
+    acceptance_path = args.outdir / "acceptance-latest.json" if args.skip_acceptance else None
     try:
         if server is not None and not wait_health(base_url, server, instance):
             print("本次启动的服务未就绪，请检查端口和启动日志。", file=sys.stderr)
@@ -143,7 +145,15 @@ def main(argv: list[str] | None = None) -> int:
                 cmd += ["--tested-commit", tested_commit]
             if args.frontend_url:
                 cmd += ["--frontend-url", args.frontend_url]
-            code = run(cmd, env=env)
+            with tempfile.TemporaryDirectory() as tmp:
+                receipt = Path(tmp) / "report-path.txt"
+                code = run([*cmd, "--report-path-file", str(receipt)], env=env)
+                if receipt.is_file():
+                    acceptance_path = Path(receipt.read_text(encoding="utf-8"))
+                if acceptance_path is None or not acceptance_path.is_file():
+                    print("本轮验收未生成归档报告，无法关联缺陷台账。", file=sys.stderr)
+                    acceptance_path = None
+                    code = code or 2
 
         if not args.skip_model:
             model_out = str(args.outdir / "model-compare")
@@ -151,9 +161,9 @@ def main(argv: list[str] | None = None) -> int:
             if not model_code:
                 model_code = run([args.python, str(HERE / "summarize_model_compare.py"), "--outdir", model_out], env=env)
             code = code or model_code
-        if not args.skip_defects:
+        if not args.skip_defects and acceptance_path is not None:
             defects_code = run([args.python, str(HERE / "track_defects.py"), "--outdir", str(args.outdir),
-                                "--acceptance", str(args.outdir / "acceptance-latest.json")], env=env)
+                                "--acceptance", str(acceptance_path)], env=env)
             code = code or defects_code
     finally:
         if server is not None and server.poll() is None:
@@ -164,9 +174,8 @@ def main(argv: list[str] | None = None) -> int:
                 server.kill()
                 server.wait()
 
-    latest = args.outdir / "acceptance-latest.json"
-    if latest.exists():
-        payload = json.loads(latest.read_text(encoding="utf-8"))
+    if acceptance_path is not None and acceptance_path.is_file():
+        payload = json.loads(acceptance_path.read_text(encoding="utf-8"))
         print(json.dumps(payload.get("meta", {}), ensure_ascii=False, indent=2))
     return code
 
