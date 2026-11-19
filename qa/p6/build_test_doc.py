@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from collections import Counter
@@ -14,8 +15,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 TEMPLATE = ROOT / "docs" / "testing" / "p6" / "P6-测试文档-模板.md"
-OUTPUT_MD = ROOT / "docs" / "testing" / "p6" / "P6-测试文档-完整.md"
-OUTPUT_DOCX = ROOT / "docs" / "testing" / "p6" / "知芽-P6-软件测试文档-刘俊延-102401133.docx"
+ARCHIVE = TEMPLATE.parent
+ARCHIVED_FILES = {
+    ARCHIVE / name for name in (
+        "P6-测试文档-完整.md", "P6-测试文档.md", "P6-交付说明.md", "P6-演示脚本.md",
+        "知芽-P6-软件测试文档-刘俊延-102401133.docx", "知芽-P6-软件测试文档-刘俊延-102401133.pdf",
+        "知芽-P6-验收演示脚本-刘俊延-102401133.docx", "知芽-P6-验收演示脚本-刘俊延-102401133.pdf",
+    )
+}
 
 MODULE_DESCRIPTIONS = OrderedDict([
     ("ENV", "协议、地址与测试配置"),
@@ -104,7 +111,10 @@ def render(template: str, payload: dict, commit: str | None = None) -> tuple[str
     problems = [item for item in results if item["status"] != "PASS"]
     security = [item for item in results if case_module(item) in {"AUTH", "SEC"}
                 or item["ac"] == "NFR-04" or item["case_id"] in {"TC-P6-CHILD-001", "TC-P6-SESS-001"}]
+    timestamp = meta.get("startedAt") or meta.get("finishedAt") or ""
+    date = re.match(r"\d{4}-\d{2}-\d{2}", timestamp)
     values = {"summary": summary, "conclusion": conclusion, "tested_commit": commit,
+              "run_date": date.group() if date else "未记录",
               "base_url": meta.get("baseUrl") or "未记录", "profile": meta.get("profile") or "未记录",
               "status_table": "\n".join(status_table),
               "exceptions": detail_table(problems) if problems else "本轮未记录异常用例。",
@@ -147,34 +157,29 @@ def render(template: str, payload: dict, commit: str | None = None) -> tuple[str
     return text, commit, summary
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--template", type=Path, default=TEMPLATE)
     parser.add_argument("--acceptance", type=Path, default=HERE / "reports" / "acceptance-latest.json")
     parser.add_argument("--tested-commit", help="旧报告未记录时补充经确认的被测提交")
-    parser.add_argument("--markdown", type=Path, default=OUTPUT_MD)
+    parser.add_argument("--markdown", type=Path)
     parser.add_argument("--docx", type=Path)
     parser.add_argument("--no-docx", action="store_true")
-    args = parser.parse_args()
-    payload = json.loads(args.acceptance.read_text(encoding="utf-8"))
-    text, commit, summary = render(args.template.read_text(encoding="utf-8"), payload, args.tested_commit)
-    args.markdown.parent.mkdir(parents=True, exist_ok=True)
-    args.markdown.write_text(text, encoding="utf-8")
-    official = args.markdown.resolve() == OUTPUT_MD.resolve()
-    if official:
-        folder = OUTPUT_MD.parent
-        (folder / "P6-测试文档.md").write_text(text, encoding="utf-8")
-        for name in ("P6-交付说明.md", "P6-演示脚本.md"):
-            path = folder / name
-            notes = path.read_text(encoding="utf-8")
-            for label, value in (("被测提交", chr(96) + commit + chr(96)), ("黑盒验收", summary + "。")):
-                notes, n = re.subn(rf"(?m)^- {label}：.*$", lambda _: f"- {label}：{value}", notes)
-                if n != 1:
-                    raise ValueError(f"{name} 缺少唯一的{label}字段")
-            path.write_text(notes, encoding="utf-8")
-    if not args.no_docx:
-        docx = args.docx or (OUTPUT_DOCX if official else args.markdown.with_suffix(".docx"))
-        subprocess.run([sys.executable, str(HERE / "md_to_docx.py"), str(args.markdown), str(docx)], check=True)
+    args = parser.parse_args(argv)
+    record = args.acceptance.read_bytes()
+    text, _, _ = render(args.template.read_text(encoding="utf-8"), json.loads(record), args.tested_commit)
+    run_id = hashlib.sha256(record).hexdigest()[:16]
+    markdown = args.markdown or args.acceptance.parent / "retests" / f"P6-复测-{run_id}.md"
+    docx = None if args.no_docx else (args.docx or markdown.with_suffix(".docx"))
+    outputs = [markdown.resolve()] + ([docx.resolve()] if docx else [])
+    protected = ARCHIVED_FILES | {TEMPLATE, args.template.resolve(), args.acceptance.resolve()}
+    if protected.intersection(outputs) or len(set(outputs)) != len(outputs):
+        parser.error("请为复测文档指定独立的输出路径，保留验收输入、模板和历史归档")
+    markdown.parent.mkdir(parents=True, exist_ok=True)
+    markdown.write_text(text, encoding="utf-8")
+    print(f"复测报告：{markdown}")
+    if docx:
+        subprocess.run([sys.executable, str(HERE / "md_to_docx.py"), str(markdown), str(docx)], check=True)
     return 0
 
 

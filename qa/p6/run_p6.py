@@ -46,6 +46,21 @@ def wait_health(base_url: str, server: subprocess.Popen, instance: str, timeout:
     return False
 
 
+def local_revision(root: Path) -> str | None:
+    # 只检查本地服务、数据准备和验收使用的输入，报告目录属于运行输出。
+    inputs = ["backend/app", "backend/requirements.txt", "database/schema.sql", "database/migrations",
+              ":(glob)database/*.py", "data/seed", ":(glob)qa/p6/*.py", "qa/p6/model_cases.json"]
+    try:
+        head = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=root, check=True,
+                              capture_output=True).stdout.decode("ascii").strip()
+        changes = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain=v1",
+                                  "--untracked-files=all", "--", *inputs],
+                                 cwd=root, check=True, capture_output=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return f"{head}-dirty" if changes else head
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="知芽 P6 一键验收")
     parser.add_argument("--base-url", help="被测地址；不传则本地启动")
@@ -78,7 +93,14 @@ def main(argv: list[str] | None = None) -> int:
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
 
+    tested_commit = args.tested_commit
     if base_url is None:
+        if not args.skip_acceptance:
+            tested_commit = local_revision(ROOT)
+            if args.tested_commit and (not tested_commit or not tested_commit.startswith(args.tested_commit)):
+                parser.error("--tested-commit 与本地服务的实际版本不符")
+            if not tested_commit:
+                print("无法确认本地 Git 版本，本轮被测提交将记为未记录。", file=sys.stderr)
         base_url = f"http://127.0.0.1:{args.port}"
         if not args.skip_prepare:
             if not args.db.exists():
@@ -118,11 +140,6 @@ def main(argv: list[str] | None = None) -> int:
             if args.account:
                 cmd += ["--account", args.account]
                 env["P6_ACCEPTANCE_PASSWORD"] = args.password
-            tested_commit = args.tested_commit
-            if not tested_commit and server is not None:
-                git = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True)
-                if git.returncode == 0:
-                    tested_commit = git.stdout.strip()
             if tested_commit:
                 cmd += ["--tested-commit", tested_commit]
             if args.frontend_url:

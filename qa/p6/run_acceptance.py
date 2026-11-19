@@ -62,8 +62,8 @@ CONTRACT_PATHS = {
 }
 
 SECURITY_HEADERS = {
-    "x-content-type-options": "nosniff",
-    "x-frame-options": "DENY",
+    "x-content-type-options": {"nosniff"},
+    "x-frame-options": {"deny", "sameorigin"},
     "content-security-policy": None,
     "referrer-policy": None,
 }
@@ -438,12 +438,12 @@ class Acceptance:
         self.revision = 1
         return "STARTED=201、重放=200、同键不同体=409、过期 revision=409"
 
-    def test_page_change(self) -> tuple[str, dict]:
+    def test_page_change(self) -> str:
         sid = self.session_id
         first_page = self.story["pages"][0]
         next_page = first_page.get("defaultNextPageNumber")
         if not next_page:
-            return "本绘本没有下一跳页，跳过翻页事件"
+            raise Blocked("所选绘本首页没有默认下一页，无法验证翻页与进度持久化")
         response = self.a.post(f"/api/v1/reading-sessions/{sid}/events", csrf=True, json={
             "eventType": "PAGE_CHANGED", "pageNumber": next_page,
             "expectedRevision": self.revision, "clientEventId": f"p6-page-{uuid4().hex[:8]}"})
@@ -541,17 +541,22 @@ class Acceptance:
         return f"{len(activities)} 项活动均含材料与步骤，内容相关性待人工复核"
 
     def test_history(self) -> str:
-        response = self.a.get("/api/v1/reading-sessions", params={"pageSize": 50})
-        body = expect(response, 200, label="阅读历史")
-        items = body["data"]["items"]
-        row = next((item for item in items if item["readingSessionId"] == self.session_id), None)
-        if row is None:
-            raise AssertionError("已结束会话未出现在历史列表")
-        if row["status"] != "FINISHED":
-            raise AssertionError(f"历史状态不正确：{row['status']}")
-        detail = self.a.get(f"/api/v1/reading-sessions/{self.session_id}")
-        expect(detail, 200, label="历史详情")
-        return "历史列表与详情均可查询，状态 FINISHED"
+        client = ApiSession(self.args.base_url, timeout=self.args.timeout, verify=not self.args.insecure_tls,
+                            allow_insecure_cookies=self.args.allow_http)
+        try:
+            expect(self.login(client, self.account, self.password), 201, label="历史查询前重新登录")
+            history = expect(client.get("/api/v1/reading-sessions", params={"pageSize": 50}),
+                             200, label="重新登录后的阅读历史")
+            if not any(row["readingSessionId"] == self.session_id and row["status"] == "FINISHED"
+                       for row in history["data"]["items"]):
+                raise AssertionError("重新登录后，历史列表中未找到本轮已结束的会话")
+            detail = expect(client.get(f"/api/v1/reading-sessions/{self.session_id}"), 200, label="历史详情")
+            session = detail["data"]["session"]
+            if session["readingSessionId"] != self.session_id or session["status"] != "FINISHED":
+                raise AssertionError("重新登录后的详情与本轮已结束的会话不符")
+            return "重新登录后，历史列表和详情均查到本轮 FINISHED 会话"
+        finally:
+            client.close()
 
     def test_event_after_finish(self) -> str:
         response = self.a.post(f"/api/v1/reading-sessions/{self.session_id}/events", csrf=True, json={
@@ -691,14 +696,22 @@ class Acceptance:
             "healthSamples": [round(x, 2) for x in health_times],
             "listSamples": [round(x, 2) for x in list_times]}
 
-    def test_security_headers(self) -> tuple[str, dict]:
+    def test_security_headers(self) -> tuple[str, dict] | Warn:
         response = self.anon.get("/api/v1/health")
-        present = {name: response.headers.get(name) for name in SECURITY_HEADERS}
-        missing = [name for name, value in present.items() if value is None]
-        detail = ("已设置: " + ", ".join(name for name, value in present.items() if value)) if len(missing) < 4 \
-            else "未设置 " + ", ".join(missing)
-        return Warn(detail + "（安全响应头不作为 P6 阻塞项，记录为警告）",
-                    {"headers": present, "missing": missing})
+        expect(response, 200, label="安全响应头检查")
+        present = {name: response.headers.get(name, "").strip() for name in SECURITY_HEADERS}
+        missing = [name for name, value in present.items() if not value]
+        invalid = [name for name, allowed in SECURITY_HEADERS.items()
+                   if allowed and present[name] and present[name].lower() not in allowed]
+        evidence = {"headers": present, "missing": missing, "invalid": invalid}
+        if missing or invalid:
+            details = []
+            if missing:
+                details.append("缺少：" + "、".join(missing))
+            if invalid:
+                details.append("取值不符：" + "、".join(invalid))
+            return Warn("；".join(details), evidence)
+        return "四项安全响应头均符合 PUB-12 检查要求", evidence
 
     def test_openapi_coverage(self) -> tuple[str, dict]:
         response = self.anon.get("/openapi.json")
@@ -740,19 +753,26 @@ class Acceptance:
 
     def test_http_redirect(self) -> str:
         if not self.args.http_url:
-            raise AssertionError("未提供 --http-url，跳过 HTTP 跳转检查")
-        client = httpx.Client(timeout=self.args.timeout, verify=not self.args.insecure_tls,
-                              follow_redirects=False)
-        try:
-            response = client.get(self.args.http_url)
-        finally:
-            client.close()
+            raise Blocked("未提供 --http-url，无法检查 HTTP 跳转")
+        entry = httpx.URL(self.args.http_url)
+        expected = httpx.URL(self.args.base_url)
+        if entry.scheme != "http" or not entry.host or entry.userinfo:
+            raise AssertionError("--http-url 必须是无凭据的绝对 HTTP 入口")
+        if expected.scheme != "https" or not expected.host or expected.userinfo:
+            raise AssertionError("--base-url 必须是被测服务的 HTTPS 地址")
+        with httpx.Client(timeout=self.args.timeout, verify=not self.args.insecure_tls,
+                          follow_redirects=False) as client:
+            response = client.get(entry)
         if response.status_code not in (301, 302, 307, 308):
             raise AssertionError(f"HTTP 入口期望 3xx 跳转，实际 {response.status_code}")
-        location = response.headers.get("location", "")
-        if not location.startswith("https://"):
-            raise AssertionError(f"跳转目标不是 HTTPS：{location}")
-        return f"{response.status_code} -> {location}"
+        location = response.headers.get("location", "").strip()
+        if not location:
+            raise AssertionError("跳转响应缺少 Location")
+        target = entry.join(location)
+        if target.userinfo or (target.scheme, target.host, target.port) != (
+                expected.scheme, expected.host, expected.port):
+            raise AssertionError("跳转目标与被测 HTTPS 服务的协议、主机或端口不符")
+        return f"HTTP {response.status_code} 跳转至被测 HTTPS 服务"
 
     # ---------- 主流程 ----------
 
@@ -816,7 +836,7 @@ class Acceptance:
         case("TC-P6-BRANCH-001", "受控故事分支选择", "AC-14", self.test_branch_choice, blocked=reading_block)
         finished = case("TC-P6-SESS-005", "结束阅读与小结", "AC-08", self.test_finish_and_report, blocked=start_block)
         finish_block = None if finished.status == PASS else "缺少已结束的会话"
-        case("TC-P6-SESS-006", "阅读历史可查询", "AC-08", self.test_history, blocked=finish_block)
+        case("TC-P6-SESS-006", "重新登录后阅读历史可查询", "AC-08", self.test_history, blocked=finish_block)
         case("TC-P6-SESS-007", "结束后禁止继续写入", "AC-10", self.test_event_after_finish, blocked=finish_block)
         case("TC-P6-SESS-008", "删除本人阅读记录", "FR-14", self.test_delete_session, blocked=reading_block)
         report = case("TC-P6-REPORT-001", "小结生成状态", "FR-09", self.test_report_status, blocked=finish_block)

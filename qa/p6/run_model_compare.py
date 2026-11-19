@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from summarize_model_compare import scoring_columns
+from summarize_model_compare import has_output, plan_fingerprint, publish_csv, publish_text, scoring_columns
 
 ROOT = Path(__file__).resolve().parents[2]
 BACKEND = ROOT / "backend"
@@ -165,43 +165,37 @@ def scoring_template(cases: list[dict], conditions: list[str], outdir: Path, dim
     path = outdir / "scoring.csv"
     columns = scoring_columns(dimensions)
     wanted = [(case["caseId"], condition) for case in cases for condition in conditions]
-    try:
-        new_file = path.open("x", newline="", encoding="utf-8-sig")
-    except FileExistsError:
-        with path.open(newline="", encoding="utf-8-sig") as existing:
-            reader = csv.DictReader(existing)
-            if reader.fieldnames != columns:
-                raise SystemExit("现有评分表列与本次计划不同，请为新计划指定独立 --outdir")
-            rows = [(row["caseId"], row["condition"]) for row in reader]
-            if sorted(rows) != sorted(wanted):
-                raise SystemExit("现有评分表与本次计划不同，请为新计划指定独立 --outdir")
+    template_rows = ({"caseId": case_id, "condition": condition} for case_id, condition in wanted)
+    if not path.exists() and publish_csv(path, columns, template_rows):
         return path
-    with new_file as handle:
-        writer = csv.DictWriter(handle, fieldnames=columns)
-        writer.writeheader()
-        for case in cases:
-            for condition in conditions:
-                writer.writerow({"caseId": case["caseId"], "condition": condition})
+    with path.open(newline="", encoding="utf-8-sig") as existing:
+        reader = csv.DictReader(existing)
+        if reader.fieldnames != columns:
+            raise SystemExit("现有评分表列与本次计划不同，请为新计划指定独立 --outdir")
+        rows = [(row["caseId"], row["condition"]) for row in reader]
+        if sorted(rows) != sorted(wanted):
+            raise SystemExit("现有评分表与本次计划不同，请为新计划指定独立 --outdir")
     return path
 
 
-def write_plan(cases: list[dict], conditions: list[str], outdir: Path, dimensions: list[str]) -> dict[str, Path]:
+def write_plan(plan: dict, outdir: Path) -> dict[str, Path]:
     outdir.mkdir(parents=True, exist_ok=True)
-    plan = {
-        "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "caseCount": len(cases),
-        "conditions": conditions,
-        "callBudget": len(cases) * len(conditions),
-        "dimensions": dimensions,
-        "cases": cases,
-    }
     plan_path = outdir / "model-compare-plan.json"
-    if plan_path.exists():
-        previous = json.loads(plan_path.read_text(encoding="utf-8"))
-        if any(previous.get(key) != plan[key] for key in ("cases", "conditions", "dimensions")):
+
+    def read_matching_plan() -> dict:
+        stored = json.loads(plan_path.read_text(encoding="utf-8"))
+        if (any(stored.get(key) != plan[key] for key in ("cases", "conditions", "dimensions", "caseCount", "callBudget"))
+                or stored.get("planHash", plan["planHash"]) != plan["planHash"]):
             raise SystemExit("评测内容已经改变，请为新计划指定独立 --outdir")
-    scoring = scoring_template(cases, conditions, outdir, dimensions)
-    plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+        return stored
+
+    previous = read_matching_plan() if plan_path.exists() else None
+    scoring = scoring_template(plan["cases"], plan["conditions"], outdir, plan["dimensions"])
+    if previous is None and not publish_text(plan_path, lambda file: json.dump(plan, file, ensure_ascii=False, indent=2)):
+        previous = read_matching_plan()
+    if previous is not None and "planHash" not in previous:
+        previous["planHash"] = plan["planHash"]
+        publish_text(plan_path, lambda file: json.dump(previous, file, ensure_ascii=False, indent=2), replace=True)
     guide = outdir / "scoring-guide.md"
     guide.write_text(
         "# 模型对比评分说明\n\n"
@@ -220,7 +214,7 @@ def write_plan(cases: list[dict], conditions: list[str], outdir: Path, dimension
     return {"plan": plan_path, "guide": guide, "scoring": scoring}
 
 
-async def run_live(args: argparse.Namespace, cases: list[dict], conditions: list[str], outdir: Path) -> int:
+async def run_live(args: argparse.Namespace, plan: dict, outdir: Path) -> int:
     from app.config import Settings
     from app.model_gateway import ModelGateway
     from app.adapters.model import ModelAdapter
@@ -241,7 +235,8 @@ async def run_live(args: argparse.Namespace, cases: list[dict], conditions: list
         model_timeout_seconds=min(args.timeout, 20.0),
         model_max_tokens=args.max_tokens,
     )
-    budget = len(cases) * len(conditions)
+    cases, conditions = plan["cases"], plan["conditions"]
+    budget = plan["callBudget"]
     if budget > args.max_calls:
         print(f"本次计划 {budget} 次调用，超过 --max-calls={args.max_calls}；"
               "如确认费用请调高上限。", file=sys.stderr)
@@ -252,6 +247,7 @@ async def run_live(args: argparse.Namespace, cases: list[dict], conditions: list
     metadata_path = outdir / f"run-{run_id}.json"
     metadata = {
         "runId": run_id,
+        "planHash": plan["planHash"],
         "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "model": settings.model_name,
         "conditions": conditions,
@@ -265,18 +261,20 @@ async def run_live(args: argparse.Namespace, cases: list[dict], conditions: list
     print(f"开始真实对比：{len(cases)} 例 × {len(conditions)} 条件 = {budget} 次调用；"
           f"model={settings.model_name}")
 
+    valid = 0
     async with ModelGateway(settings) as gateway:
         adapter = ModelAdapter(gateway)
         with results_path.open("x", encoding="utf-8") as handle:
             for case in cases:
                 knowledge = knowledge_for(case, args.db) if "domain" in conditions else []
                 for condition in conditions:
-                    request, label = build_request(case, condition, knowledge)
+                    request, _ = build_request(case, condition, knowledge)
                     started = time.perf_counter()
                     result = await adapter.generate(request)
                     elapsed = int((time.perf_counter() - started) * 1000)
                     row = {
                         "runId": run_id,
+                        "planHash": plan["planHash"],
                         "caseId": case["caseId"],
                         "evalId": case["evalId"],
                         "condition": condition,
@@ -300,10 +298,17 @@ async def run_live(args: argparse.Namespace, cases: list[dict], conditions: list
                     }
                     handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                     handle.flush()
-                    status = "OK" if result.success else f"FAIL({result.error_code})"
+                    if has_output(row):
+                        valid += 1
+                        status = "OK"
+                    else:
+                        status = f"FAIL({result.error_code or '空输出'})"
                     print(f"{case['caseId']:<8} {condition:<10} {status:<18} {elapsed}ms")
     print(f"结果：{results_path}")
     print(f"元数据：{metadata_path}")
+    if not valid:
+        print("本轮没有可评分输出，请检查原始结果。", file=sys.stderr)
+        return 1
     print("下一步：运行 summarize_model_compare.py 生成本轮评分表，评分后用同一结果文件再次汇总。")
     return 0
 
@@ -324,15 +329,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, help="只跑前 N 个案例（调试用）")
     args = parser.parse_args(argv)
 
-    payload = load_cases(args.cases)
-    cases = payload["cases"][: args.limit] if args.limit else payload["cases"]
-    conditions = [item.strip() for item in args.conditions.split(",") if item.strip()]
+    if args.limit is not None and args.limit < 1:
+        print("--limit 必须为正整数", file=sys.stderr)
+        return 2
+    conditions = [item.strip() for item in args.conditions.split(",")]
+    if not all(conditions) or len(conditions) != len(set(conditions)):
+        print("--conditions 不能包含空项或重复条件", file=sys.stderr)
+        return 2
     unknown = set(conditions) - {"baseline", "page_only", "domain"}
     if unknown:
         print(f"未知条件：{sorted(unknown)}", file=sys.stderr)
         return 2
-    dimensions = payload.get("dimensions") or []
-    paths = write_plan(cases, conditions, args.outdir, dimensions)
+    payload = load_cases(args.cases)
+    cases = payload["cases"][:args.limit]
+    plan = {"cases": cases, "conditions": conditions, "dimensions": payload.get("dimensions") or [],
+            "caseCount": len(cases), "callBudget": len(cases) * len(conditions),
+            "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    plan["planHash"] = plan_fingerprint(plan)
+    paths = write_plan(plan, args.outdir)
     print(f"评测集：{len(cases)} 例，条件：{conditions}，计划调用 {len(cases) * len(conditions)} 次")
     print(f"计划：{paths['plan']}")
     print(f"评分指南：{paths['guide']}")
@@ -341,7 +355,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.live:
         print("\n当前为 dry-run：未调用任何模型。真实执行请设置 MODEL_API_KEY 并加 --live。")
         return 0
-    return asyncio.run(run_live(args, cases, conditions, args.outdir))
+    return asyncio.run(run_live(args, plan, args.outdir))
 
 
 if __name__ == "__main__":

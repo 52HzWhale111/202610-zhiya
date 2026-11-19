@@ -25,7 +25,6 @@ META = [
     ("团队", "妈妈夸我说的队"),
     ("编写", "刘俊延（102401133，测试验收演示）"),
     ("版本", "v1.0"),
-    ("日期", "2026-11-18"),
 ]
 
 
@@ -277,7 +276,11 @@ def build(markdown: Path, output: Path, *, title_text: str = TITLE, subtitle_tex
     style_document(doc, header_text)
     match = re.search(r"(?m)^- 被测提交：`([^`\n]+)`", text)
     commit = match.group(1) if match else "未记录"
-    add_cover(doc, title_text, subtitle_text, [*META, ("被测提交", commit)])
+    date = re.search(r"(?m)^\| (?:本轮测试日期|编写日期) \| ([^|\n]+?) \|", text)
+    if date is None:
+        date = re.search(r"(?m)^- 版本：[^\n]*?（(\d{4}-\d{2}-\d{2})）", text)
+    add_cover(doc, title_text, subtitle_text,
+              [*META, ("日期", date.group(1) if date else "未记录"), ("被测提交", commit)])
 
     index = 0
     first_h1 = True

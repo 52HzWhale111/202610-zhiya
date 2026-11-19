@@ -9,10 +9,14 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import statistics
+import sys
+import tempfile
 from collections import Counter, defaultdict
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUT = ROOT / "qa" / "p6" / "reports" / "model-compare"
@@ -30,7 +34,6 @@ def load_results(path: Path | None) -> list[dict[str, Any]]:
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.strip():
             row = json.loads(line)
-            row.setdefault("runId", path.stem)  # 旧归档以结果文件名标识本轮。
             rows.append(row)
     return rows
 
@@ -56,41 +59,118 @@ def scoring_columns(dimensions: list[str]) -> list[str]:
     return ["caseId", "condition", "model", "outputExcerpt", *grades, "rater1_note", "rater2_note"]
 
 
+def plan_fingerprint(plan: dict) -> str:
+    inputs = {key: plan[key] for key in ("cases", "conditions", "dimensions")}
+    canonical = json.dumps(inputs, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def plan_issue(plan: dict, results: list[dict]) -> str | None:
+    fingerprint = plan.get("planHash")
+    if fingerprint and fingerprint != plan_fingerprint(plan):
+        return "计划内容与其指纹不一致"
+    if fingerprint and (plan.get("caseCount") != len(plan["cases"])
+                        or plan.get("callBudget") != len(plan["cases"]) * len(plan["conditions"])):
+        return "计划中的案例数或调用预算与评测范围不一致"
+    if not results:
+        return None
+    if not fingerprint or any(not row.get("planHash") for row in results):
+        return "旧计划或结果缺少计划指纹，原始输出仅供查阅；请用同一份新计划重新执行后评分"
+    if any(row["planHash"] != fingerprint for row in results):
+        return "结果与所选计划的指纹不一致，请指定生成该结果的计划"
+    run_ids = {row.get("runId") for row in results}
+    if len(run_ids) != 1 or not all(run_ids):
+        return "结果必须来自同一轮有标识的运行"
+    return None
+
+
+def has_output(row: dict) -> bool:
+    return row.get("success") is True and isinstance(row.get("output"), str) and bool(row["output"].strip())
+
+
 def output_key(row: dict) -> str:
-    fields = [row["runId"], row["caseId"], row["condition"], row.get("model"), row["output"]]
+    fields = [row["planHash"], row["runId"], row["caseId"], row["condition"], row.get("model"), row["output"]]
     return hashlib.sha256(json.dumps(fields, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def eligible_outputs(plan: dict, results: list[dict]) -> dict:
-    if len({row.get("runId") for row in results}) != 1:
+    if not results or plan_issue(plan, results):
         return {}
-    cases = {case["caseId"] for case in plan.get("cases", [])}
+    cases = {case["caseId"] for case in plan["cases"]}
     occurrences = Counter((row["caseId"], row["condition"]) for row in results)
     outputs = {}
     for row in results:
         key = (row["caseId"], row["condition"])
-        if (occurrences[key] == 1 and row.get("success") is True and (row.get("output") or "").strip()
-                and row.get("runId") and row["condition"] in plan["conditions"]
-                and (not cases or row["caseId"] in cases)):
+        if (occurrences[key] == 1 and has_output(row) and row["condition"] in plan["conditions"]
+                and row["caseId"] in cases):
             outputs[key] = row
     return outputs
 
 
-def score_sheet(outdir: Path, results_path: Path, outputs: dict, dimensions: list[str]) -> Path:
-    keys = [output_key(row) for row in outputs.values()]
-    digest = hashlib.sha256("".join(sorted(keys)).encode("ascii")).hexdigest()[:12]
-    path = outdir / f"scoring-{results_path.stem.removeprefix('results-')}-{digest}.csv"
+def publish_text(path: Path, write: Callable[[TextIO], None], *, encoding: str = "utf-8",
+                 replace: bool = False) -> bool:
+    """先写完整临时文件，再原子发布。默认保留已有文件。"""
+    temporary = tempfile.NamedTemporaryFile(dir=path.parent, mode="w", encoding=encoding,
+                                           newline="", delete=False)
     try:
-        handle = path.open("x", newline="", encoding="utf-8-sig")
-    except FileExistsError:
-        return path
-    with handle:
-        writer = csv.DictWriter(handle, fieldnames=["outputKey", *scoring_columns(dimensions)])
+        with temporary as handle:
+            write(handle)
+        try:
+            if replace:
+                os.replace(temporary.name, path)
+            elif os.name == "nt":
+                os.rename(temporary.name, path)  # Windows 的 rename 遇到已存在的目标会失败。
+            else:
+                os.link(temporary.name, path)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        Path(temporary.name).unlink(missing_ok=True)
+
+
+def publish_csv(path: Path, columns: list[str], rows: Iterable[dict]) -> bool:
+    def write(handle: TextIO) -> None:
+        writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
-        for row, key in zip(outputs.values(), keys):
-            writer.writerow({"caseId": row["caseId"], "condition": row["condition"], "model": row.get("model"),
-                             "outputExcerpt": row["output"][:200], "outputKey": key})
-    return path
+        writer.writerows(rows)
+
+    return publish_text(path, write, encoding="utf-8-sig")
+
+
+def score_sheet(outdir: Path, results_path: Path, outputs: dict, dimensions: list[str]) -> Path:
+    columns = ["outputKey", *scoring_columns(dimensions)]
+    rows = {}
+    for output in outputs.values():
+        key = output_key(output)
+        rows[key] = {"outputKey": key, "caseId": output["caseId"], "condition": output["condition"],
+                     "model": output.get("model"), "outputExcerpt": output["output"][:200]}
+    digest = hashlib.sha256("".join(sorted(rows)).encode("ascii")).hexdigest()[:12]
+    path = outdir / f"scoring-{results_path.stem.removeprefix('results-')}-{digest}.csv"
+    # 旧版可能留下半张表。按输出标识保留已填的评分，将缺失行补到独立副本。
+    for candidate in (path, path.with_stem(path.stem + "-recovered")):
+        if not candidate.exists() and publish_csv(candidate, columns, rows.values()):
+            return candidate
+        with candidate.open(encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is not None and reader.fieldnames != columns:
+                raise ValueError(f"评分表列不匹配，请核对 {candidate}")
+            seen = set()
+            complete = True
+            for saved in reader:
+                if None in saved.values():
+                    complete = False
+                    if saved["condition"] is None:  # 写入在标识字段内中断，此行还没有评分。
+                        continue
+                key = saved["outputKey"]
+                if (None in saved or key not in rows or key in seen or saved["caseId"] != rows[key]["caseId"]
+                        or saved["condition"] != rows[key]["condition"]):
+                    raise ValueError(f"评分行与原始输出不匹配，请核对 {candidate}")
+                seen.add(key)
+                rows[key].update({col: saved[col] for col in columns if col.startswith("rater")})
+        if complete and seen == rows.keys():
+            return candidate
+    raise ValueError(f"恢复副本仍不完整，请核对 {candidate}")
 
 
 def mean(values: list[float]) -> float | None:
@@ -168,6 +248,7 @@ def summarize(plan: dict, results: list[dict], scores: list[dict], dimensions: l
         "conditions": conditions,
         "callBudget": plan["callBudget"],
         "resultRows": len(results),
+        "validOutputRows": len(outputs),
         "scoredRows": scored_rows,
         "unmatchedScoreRows": len(graded) - scored_rows,
         "conditionMeans": condition_means,
@@ -191,7 +272,7 @@ def export_outputs(results: list[dict], outdir: Path, source: Path | None) -> Pa
                   f"- 任务：{first.get('task')}；年龄：{first.get('ageBand')}",
                   f"- 输入：{first.get('userInput')}", f"- 期望：{first.get('expected')}", ""]
         for row in rows:
-            status = "成功" if row.get("success") else f"失败（{row.get('errorCode')}）"
+            status = "成功" if has_output(row) else f"无有效输出（{row.get('errorCode') or '空输出'}）"
             lines += [f"### {row['condition']} / {status} / {row.get('latencyMs')} ms", "",
                       "```text", (row.get("output") or "").strip() or "（空输出）", "```", ""]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -204,13 +285,15 @@ def write_markdown(summary: dict, outdir: Path, results_path: Path | None, dimen
              f"- 评测案例：{summary['caseCount']} 例",
              f"- 条件：{', '.join(summary['conditions'])}",
              f"- 计划调用：{summary['callBudget']} 次",
-             f"- 已记录结果：{summary['resultRows']} 条",
+             f"- 已记录结果：{summary['resultRows']} 条，可评分输出 {summary['validOutputRows']} 条",
              f"- 已评分行：{summary['scoredRows']} 行，另有 {summary['unmatchedScoreRows']} 行未匹配本轮有效输出",
              f"- 本轮评分表：{scores_path.name if scores_path else '待生成成功输出'}",
              f"- 原始结果：{results_path.name if results_path else '未执行'}", ""]
-    if not summary["resultRows"]:
+    if results_path is None:
         lines += ["> **执行状态：未进行真实模型调用。** 当前环境未提供 MODEL_API_KEY，"
                   "或尚未执行 `run_model_compare.py --live`。本文件不包含模型效果结论。", ""]
+    elif not summary["validOutputRows"]:
+        lines += ["> **执行状态：本轮没有可评分输出。** 请检查原始结果是否为空、调用失败或返回空文本。", ""]
     if not summary["scoredRows"]:
         lines += ["> **评分状态：待取得成功输出并由两位评分人填写对应评分表。** 空表不会被计为通过。", ""]
 
@@ -261,10 +344,21 @@ def main(argv: list[str] | None = None) -> int:
     dimensions = plan.get("dimensions") or []
     results_path = args.results or latest_results(outdir)
     results = load_results(results_path)
+    issue = plan_issue(plan, results)
+    if issue:
+        print(issue, file=sys.stderr)
+        raw = export_outputs(results, outdir, results_path)
+        if raw:
+            print(f"原始输出：{raw}")
+        return 2
     outputs = eligible_outputs(plan, results)
     scores_path = args.scores
     if scores_path is None and outputs:
-        scores_path = score_sheet(outdir, results_path, outputs, dimensions)
+        try:
+            scores_path = score_sheet(outdir, results_path, outputs, dimensions)
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            return 2
     scores = load_scores(scores_path, dimensions) if scores_path else []
     summary = summarize(plan, results, scores, dimensions)
     outputs = export_outputs(results, outdir, results_path)
@@ -278,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
     if outputs:
         print(f"原始输出：{outputs}")
     print(f"结果 {len(results)} 条，已评分 {summary['scoredRows']} 行")
-    return 0
+    return 1 if results_path is not None and not summary["validOutputRows"] else 0
 
 
 if __name__ == "__main__":

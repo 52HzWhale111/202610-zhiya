@@ -58,7 +58,7 @@ python qa/p6/run_acceptance.py \
   --frontend-url https://your-domain.example
 ```
 
-已有账号的密码可通过环境变量 `P6_ACCEPTANCE_PASSWORD` 传入。外部部署可用 `--tested-commit` 记录实际版本。公网模式要求启用证书校验的 HTTPS；脚本会检查证书链、HTTP→HTTPS 跳转、HSTS、Cookie 的
+已有账号的密码可通过环境变量 `P6_ACCEPTANCE_PASSWORD` 传入。外部部署可用 `--tested-commit` 记录实际版本。公网模式要求启用证书校验的 HTTPS；脚本会检查证书链、HTTP 入口是否跳转到被测 HTTPS 服务的主机和端口、HSTS、Cookie 的
 `Secure/HttpOnly/SameSite` 属性、演示账号主流程与响应时间。`--frontend-url`
 用于检查前端页面是否可访问；未提供时前端验收记为 BLOCKED，不会写成通过。前端代码另有 71 项 Vitest，可通过 `npm --prefix frontend test` 执行。
 
@@ -77,8 +77,12 @@ python qa/p6/summarize_model_compare.py
 
 默认条件为 `baseline,domain`（通用模型 vs 领域条件）。如需消融实验，加
 `--conditions baseline,page_only,domain`。每次调用都会计费，脚本默认最多 48 次，
-超过需显式调高 `--max-calls`。结果写入 `reports/model-compare/results-*.jsonl`，
+超过需显式调高 `--max-calls`。`--limit N` 取前 N 例，N 必须是正整数。条件列表中的每项都须有效且唯一。结果写入 `reports/model-compare/results-*.jsonl`，
 首次汇总会为成功且非空的输出生成独立评分表，文件名以 `scoring-` 开头并包含运行标识。两位评分人填写该表后，用同一个 `--results <结果 JSONL 路径>` 参数再次汇总。换运行或输出发生变化时使用新表，原有人工评分和备注保存在原表中。通用与领域两种条件都有本轮成功输出，且两位评分人填完全部维度后，才计算配对胜平负。dry-run 生成的 `scoring.csv` 供预览评分格式。
+
+计划、运行元数据和每条结果都记录同一个 SHA-256 指纹，覆盖完整案例、条件和评分维度。旧结果缺少指纹时可导出原始内容供查阅，重新运行后即可评分。汇总遇到残缺的评分表时会保留原文件，并打印补齐后的 `-recovered.csv` 路径，请在该副本继续评分。
+
+仅生成计划且没有结果文件时，执行和汇总均返回 0。实际运行或汇总没有可评分输出时返回 1，原始结果保留供排查。非法调用范围或计划与结果不匹配时返回 2。
 
 ## 产物
 
@@ -94,10 +98,10 @@ python qa/p6/summarize_model_compare.py
 ## 边界与注意
 
 - `run_p6.py --outdir <目录>` 将黑盒报告、缺陷台账和模型子目录写入同一轮输出。
-- `python qa/p6/build_test_doc.py` 根据同一份验收 JSON 生成报告正文、封面版本和交付摘要。自定义报告可用 `--acceptance <JSON> --markdown <新路径>` 单独导出。
+- `python qa/p6/build_test_doc.py --acceptance <JSON>` 在该 JSON 旁的 `retests/` 下生成本轮 Markdown 和 Word 报告，文件名包含输入指纹，日期和提交取自运行记录。可用 `--markdown <新路径>`、`--docx <新路径>` 指定输出，或用 `--no-docx` 仅生成 Markdown。11 月 18 日交付的文档、演示脚本及 PDF 保留原版。
 - 黑盒脚本不导入后端代码，不读取 `.env`，不接触真实密钥。
 - 一键入口和演示默认跳过已鉴权的有效合成请求。明确确认被测服务禁用 TTS 后，传 `--voice-expect-unconfigured` 验证 503；真实语音使用 `--voice-live`（演示为 `--voice`），遇 503 不能判为真实合成通过。
-- 一键启动会核对本次进程的健康响应。端口被占用时，可用 `--port` 选择其他本地端口。仅 `--text-model-live` 允许它启动的后端用真实文本模型生成阅读小结。已有外部服务沿用部署方的模型配置。
+- 一键启动会核对本次进程的健康响应，并记录被测 Git 提交。本地服务、数据库输入或验收脚本有未提交变动时，提交号附加 `-dirty`。端口被占用时，可用 `--port` 选择其他本地端口。仅 `--text-model-live` 允许它启动的后端用真实文本模型生成阅读小结。已有外部服务沿用部署方的模型配置。
 - 登录遇到 429 时，独立检查继续执行，依赖登录的用例逐条记录为阻塞。退出码 1 表示有用例失败，2 表示环境或核心流程受阻。0 表示核心流程已执行且无失败，仍需查看报告中的专项阻塞和警告。
 - 指定 `--story-version-id` 时按版本号读取详情，版本不可用会中止该绘本的验收或演示。准备演示数据时，已有同名账号须与所需角色一致。
 - 结束阅读后，验收会在 `--timeout` 秒内读取会话详情，记录小结终态，并核对已就绪活动的材料和步骤。

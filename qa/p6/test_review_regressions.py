@@ -201,10 +201,13 @@ def test_preserve_manual_scores_and_reject_changed_plan(tmp_path):
 
 
 def test_equal_raters_and_partial_scores():
-    plan = {"caseCount": 1, "callBudget": 2, "conditions": ["baseline", "domain"]}
+    plan = {"caseCount": 1, "callBudget": 2, "conditions": ["baseline", "domain"],
+            "cases": [{"caseId": "C"}], "dimensions": ["x"]}
+    plan["planHash"] = summarize_model_compare.plan_fingerprint(plan)
     scores = [dict(caseId="C", condition=c, rater1_x=a, rater2_x=b)
               for c, a, b in [("baseline", 2, 0), ("domain", 0, 2)]]
-    results = [dict(caseId="C", condition=c, runId="run-A", model="fixture", success=True, output=c)
+    results = [dict(caseId="C", condition=c, runId="run-A", planHash=plan["planHash"],
+                    model="fixture", success=True, output=c)
                for c in plan["conditions"]]
     for row, output in zip(scores, results):
         row["outputKey"] = summarize_model_compare.output_key(output)
@@ -262,7 +265,8 @@ def test_bound_scoring_sheet_preserves_each_run(tmp_path):
     case_id = plan["cases"][0]["caseId"]
     def report(run):
         path = tmp_path / f"results-{run}.jsonl"
-        rows = [dict(caseId=case_id, condition=c, model="fixture", success=True, output="sample")
+        rows = [dict(caseId=case_id, condition=c, runId=run, planHash=plan["planHash"],
+                     model="fixture", success=True, output="sample")
                 for c in plan["conditions"]]
         path.write_text("\n".join(json.dumps(row) for row in rows), "utf-8")
         return ["--outdir", str(tmp_path), "--results", str(path)]
@@ -295,6 +299,7 @@ def test_bound_scoring_sheet_preserves_each_run(tmp_path):
 
 @pytest.mark.parametrize("allow_model", [False, True])
 def test_local_runner_only_uses_its_own_service(tmp_path, monkeypatch, allow_model):
+    monkeypatch.setattr(run_p6, "local_revision", lambda _: "abcdef0")
     server = Mock()
     server.poll.side_effect = [None, 1, 1]
     launcher = Mock(return_value=server)
