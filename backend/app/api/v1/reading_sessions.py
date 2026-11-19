@@ -28,6 +28,7 @@ from app.services.reading_reports import (
     generate_report,
     report_object,
 )
+from app.services.story_media import MediaDependencyError, ensure_opening_media
 
 router = APIRouter(prefix="/api/v1/reading-sessions")
 MAX_ID = 9007199254740991
@@ -94,8 +95,12 @@ class ModeSettings(BaseModel):
 def current_question(db: sqlite3.Connection, session: sqlite3.Row) -> sqlite3.Row | None:
     questions = db.execute(
         """SELECT output_text, response_json FROM interaction_events
-           WHERE session_id = ? AND version_id = ? AND page_no = ? AND event_type = 'QUESTION'
+           WHERE session_id = ? AND version_id = ? AND page_no = ?
+             AND (event_type = 'QUESTION' OR
+                  (event_type = 'FEEDBACK' AND feedback IN ('UNDERSTOOD', 'NOT_UNDERSTOOD')))
              AND result_status IN ('SUCCESS', 'FALLBACK') AND output_text IS NOT NULL
+             AND COALESCE(strategy_type, json_extract(response_json, '$.data.strategyType'), '')
+                 NOT IN ('SKIP', 'SAFETY_BLOCK')
            ORDER BY id DESC""",
         (session["id"], session["version_id"], session["current_page_no"]),
     )
@@ -151,13 +156,15 @@ def create_session(payload: SessionCreate, request: Request):
             profile = db.execute("SELECT 1 FROM child_profiles WHERE id = ? AND guardian_id = ?",
                                  (payload.childProfileId, owner)).fetchone()
             version = db.execute(
-                "SELECT v.id FROM story_versions v JOIN storybooks b ON b.id = v.storybook_id "
+                "SELECT v.*, b.source_type AS storybook_source_type FROM story_versions v "
+                "JOIN storybooks b ON b.id = v.storybook_id "
                 "WHERE v.id = ? AND " + VISIBLE +
                 " AND EXISTS (SELECT 1 FROM story_pages p WHERE p.version_id = v.id AND p.page_no = 1)",
                 (payload.storyVersionId, owner, True, owner),
             ).fetchone()
             if not profile or not version:
                 return error(request, 404, "RESOURCE_NOT_FOUND", "档案或绘本不可用")
+            ensure_opening_media(db, version)
             cursor = db.execute(
                 """INSERT INTO reading_sessions
                 (profile_id, version_id, current_page_no, mode, status, created_at)
@@ -167,6 +174,8 @@ def create_session(payload: SessionCreate, request: Request):
             row = db.execute("SELECT *, NULL AS grant_expires_at FROM reading_sessions WHERE id = ?",
                              (cursor.lastrowid,)).fetchone()
             return {"data": session_object(row), "requestId": request.state.request_id}
+    except MediaDependencyError:
+        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
     except sqlite3.Error:
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
 
@@ -196,16 +205,39 @@ def list_sessions(request: Request, page: int = Query(default=1, ge=1, le=MAX_ID
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
 
 
+def session_event_object(event: sqlite3.Row) -> dict:
+    data = {"interactionEventId": event["id"], "eventType": event["event_type"], "pageNumber": event["page_no"]}
+    # Only project a finalized guidance response; older rows may contain unverified text.
+    if (event["event_type"] in ("QUESTION", "FEEDBACK") and event["strategy_type"]
+            and event["saved_id"] == event["id"]):
+        data.update(outputText=event["output_text"], strategyType=event["strategy_type"])
+        if event["feedback"] is not None:
+            data["feedback"] = event["feedback"]
+    return data
+
+
 @router.get("/{session_id}")
-def get_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
+def get_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID),
+                view: Literal["reading", "deletion-status"] = "reading"):
+    deletion_check = view == "deletion-status"
     try:
-        with authorized_db(request) as (db, principal, failure):
+        with authorized_db(
+            request, guardian_only=deletion_check, settle_guardian=not deletion_check
+        ) as (db, principal, failure):
             if failure:
                 return failure
+            if deletion_check:
+                target = owned_deletion_target(db, session_id, principal.guardian_id)
+                return JSONResponse(
+                    content={"data": {"exists": target is not None}, "requestId": request.state.request_id},
+                    headers={"Cache-Control": "no-store"},
+                )
             row = owned_session(db, session_id, principal)
             if not row:
                 return error(request, 404, "RESOURCE_NOT_FOUND", "会话不可用")
-            event_query = "SELECT id, event_type, page_no FROM interaction_events WHERE session_id = ?"
+            event_query = """SELECT id, event_type, page_no, feedback, output_text, strategy_type,
+                                    json_extract(response_json, '$.data.interactionEventId') AS saved_id
+                             FROM interaction_events WHERE session_id = ?"""
             event_params = [session_id]
             if principal.role == "CHILD":
                 event_query += " AND page_no = ?"
@@ -216,8 +248,7 @@ def get_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
                 report_row = db.execute("SELECT * FROM reading_reports WHERE session_id = ?", (session_id,)).fetchone()
                 report = report_object(session_id, report_row)
             data = {"session": session_object(row),
-                    "events": [{"interactionEventId": e["id"], "eventType": e["event_type"],
-                                "pageNumber": e["page_no"]} for e in events],
+                    "events": [session_event_object(event) for event in events],
                     "report": report}
             if principal.role == "CHILD" and row["status"] == "IN_PROGRESS":
                 data["answerOptions"] = child_answer_options(db, row)
@@ -327,6 +358,15 @@ def update_mode_settings(payload: ModeSettings, request: Request, session_id: in
     return response
 
 
+def owned_deletion_target(db, session_id: int, guardian_id: int):
+    return db.execute(
+        """SELECT s.id, s.grant_id FROM reading_sessions s
+           JOIN child_profiles p ON p.id = s.profile_id
+           WHERE s.id = ? AND p.guardian_id = ?""",
+        (session_id, guardian_id),
+    ).fetchone()
+
+
 @router.delete("/{session_id}", status_code=204)
 def delete_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
     """API-014: delete a guardian-owned reading session, its derived rows, and revoke its active grant."""
@@ -334,13 +374,7 @@ def delete_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
         with authorized_db(request, write=True, guardian_only=True, settle_guardian=False) as (db, principal, failure):
             if failure:
                 return failure
-            owner = principal.guardian_id
-            row = db.execute(
-                """SELECT s.id, s.grant_id FROM reading_sessions s
-                JOIN child_profiles p ON p.id = s.profile_id
-                WHERE s.id = ? AND p.guardian_id = ?""",
-                (session_id, owner),
-            ).fetchone()
+            row = owned_deletion_target(db, session_id, principal.guardian_id)
             if not row:
                 return error(request, 404, "RESOURCE_NOT_FOUND", "会话不可用")
             now = int(time.time() * 1000)
@@ -546,6 +580,7 @@ def choose_branch(payload: BranchChoice, request: Request, session_id: int = Pat
             if not next_page:
                 return fail_session_event(db, request, principal.guardian_id, session_id, payload.clientEventId,
                                           digest, 404, "RESOURCE_NOT_FOUND", "目标页面不可用")
+            next_page_data = page_object(db, next_page)
             now = int(time.time() * 1000)
             revision = row["revision"] + 1
             visited = json.loads(row["visited_pages_json"])
@@ -569,7 +604,7 @@ def choose_branch(payload: BranchChoice, request: Request, session_id: int = Pat
                     "currentPage": next_page["page_no"],
                     "revision": revision,
                     "interactionEventId": cursor.lastrowid,
-                    "nextPage": page_object(next_page),
+                    "nextPage": next_page_data,
                     "visitedPageNumbers": visited,
                 },
                 "requestId": request.state.request_id,
@@ -578,6 +613,8 @@ def choose_branch(payload: BranchChoice, request: Request, session_id: int = Pat
                        (json.dumps(response, ensure_ascii=False), cursor.lastrowid))
             record_session_event(db, principal.guardian_id, session_id, payload.clientEventId, digest, now, 201, response)
             return JSONResponse(status_code=201, content=response)
+    except MediaDependencyError:
+        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
     except sqlite3.Error:
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
 
