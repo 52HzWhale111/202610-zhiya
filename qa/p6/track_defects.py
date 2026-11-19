@@ -54,7 +54,7 @@ def auto_defects(acceptance: dict[str, Any] | None, existing: list[dict]) -> lis
         if result.get("status") != "FAIL" or case_id in covered:
             continue
         created.append({
-            "id": f"DEF-P6-AUTO-{case_id.split('-')[-1]}",
+            "id": f"DEF-P6-AUTO-{case_id.removeprefix('TC-P6-')}",
             "title": f"自动验收失败：{result.get('title', '')}",
             "severity": "P1",
             "category": "自动化发现",

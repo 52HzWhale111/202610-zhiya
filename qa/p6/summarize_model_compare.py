@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,9 @@ def load_results(path: Path | None) -> list[dict[str, Any]]:
     rows = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.strip():
-            rows.append(json.loads(line))
+            row = json.loads(line)
+            row.setdefault("runId", path.stem)  # 旧归档以结果文件名标识本轮。
+            rows.append(row)
     return rows
 
 
@@ -48,6 +51,48 @@ def load_scores(path: Path, dimensions: list[str]) -> list[dict[str, Any]]:
     return rows
 
 
+def scoring_columns(dimensions: list[str]) -> list[str]:
+    grades = [f"{rater}_{dimension}" for rater in ("rater1", "rater2") for dimension in dimensions]
+    return ["caseId", "condition", "model", "outputExcerpt", *grades, "rater1_note", "rater2_note"]
+
+
+def output_key(row: dict) -> str:
+    fields = [row["runId"], row["caseId"], row["condition"], row.get("model"), row["output"]]
+    return hashlib.sha256(json.dumps(fields, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def eligible_outputs(plan: dict, results: list[dict]) -> dict:
+    if len({row.get("runId") for row in results}) != 1:
+        return {}
+    cases = {case["caseId"] for case in plan.get("cases", [])}
+    occurrences = Counter((row["caseId"], row["condition"]) for row in results)
+    outputs = {}
+    for row in results:
+        key = (row["caseId"], row["condition"])
+        if (occurrences[key] == 1 and row.get("success") is True and (row.get("output") or "").strip()
+                and row.get("runId") and row["condition"] in plan["conditions"]
+                and (not cases or row["caseId"] in cases)):
+            outputs[key] = row
+    return outputs
+
+
+def score_sheet(outdir: Path, results_path: Path, outputs: dict, dimensions: list[str]) -> Path:
+    keys = [output_key(row) for row in outputs.values()]
+    digest = hashlib.sha256("".join(sorted(keys)).encode("ascii")).hexdigest()[:12]
+    path = outdir / f"scoring-{results_path.stem.removeprefix('results-')}-{digest}.csv"
+    try:
+        handle = path.open("x", newline="", encoding="utf-8-sig")
+    except FileExistsError:
+        return path
+    with handle:
+        writer = csv.DictWriter(handle, fieldnames=["outputKey", *scoring_columns(dimensions)])
+        writer.writeheader()
+        for row, key in zip(outputs.values(), keys):
+            writer.writerow({"caseId": row["caseId"], "condition": row["condition"], "model": row.get("model"),
+                             "outputExcerpt": row["output"][:200], "outputKey": key})
+    return path
+
+
 def mean(values: list[float]) -> float | None:
     return round(statistics.mean(values), 3) if values else None
 
@@ -60,7 +105,17 @@ def summarize(plan: dict, results: list[dict], scores: list[dict], dimensions: l
     per_case_condition: dict[tuple[str, str], list[int]] = defaultdict(list)
     agreement = {dimension: {"exact": 0, "within1": 0, "total": 0} for dimension in dimensions}
 
-    for row in scores:
+    outputs = eligible_outputs(plan, results)
+    grades = [f"{rater}_{d}" for rater in ("rater1", "rater2") for d in dimensions]
+    graded = [row for row in scores if any(isinstance(row.get(g), int) for g in grades)]
+    occurrences = Counter((row["caseId"], row["condition"]) for row in graded)
+    scored_rows = 0
+    for row in graded:
+        key = (row["caseId"], row["condition"])
+        output = outputs.get(key)
+        if output is None or occurrences[key] != 1 or row.get("outputKey") != output_key(output):
+            continue
+        scored_rows += 1
         condition = row["condition"]
         case_id = row["caseId"]
         for rater in ("rater1", "rater2"):
@@ -97,6 +152,8 @@ def summarize(plan: dict, results: list[dict], scores: list[dict], dimensions: l
             base = per_case_condition.get((case_id, "baseline"))
             domain = per_case_condition.get((case_id, "domain"))
             if base and domain and len(base) == len(domain) == 2:
+                if outputs[(case_id, "baseline")].get("model") != outputs[(case_id, "domain")].get("model"):
+                    continue
                 base_score = sum(base) / (2 * len(dimensions))
                 domain_score = sum(domain) / (2 * len(dimensions))
                 outcome = "胜" if domain_score > base_score else "平" if domain_score == base_score else "负"
@@ -111,19 +168,18 @@ def summarize(plan: dict, results: list[dict], scores: list[dict], dimensions: l
         "conditions": conditions,
         "callBudget": plan["callBudget"],
         "resultRows": len(results),
-        "scoredRows": sum(1 for row in scores if any(
-            isinstance(row.get(f"{rater}_{dimension}"), int)
-            for rater in ("rater1", "rater2") for dimension in dimensions)),
+        "scoredRows": scored_rows,
+        "unmatchedScoreRows": len(graded) - scored_rows,
         "conditionMeans": condition_means,
         "paired": {"wins": wins, "ties": ties, "losses": losses, "cases": pairs},
         "agreement": agreement,
     }
 
 
-def export_outputs(results: list[dict], outdir: Path) -> Path | None:
-    if not results:
+def export_outputs(results: list[dict], outdir: Path, source: Path | None) -> Path | None:
+    if not results or source is None:
         return None
-    path = outdir / "outputs-for-scoring.md"
+    path = outdir / f"outputs-for-scoring-{source.stem}.md"
     lines = ["# 模型原始输出（供评分）", ""]
     grouped: dict[str, list[dict]] = defaultdict(list)
     for row in results:
@@ -142,19 +198,21 @@ def export_outputs(results: list[dict], outdir: Path) -> Path | None:
     return path
 
 
-def write_markdown(summary: dict, outdir: Path, results_path: Path | None, dimensions: list[str]) -> Path:
+def write_markdown(summary: dict, outdir: Path, results_path: Path | None, dimensions: list[str],
+                   scores_path: Path | None) -> Path:
     lines = ["# 模型对比汇总", "",
              f"- 评测案例：{summary['caseCount']} 例",
              f"- 条件：{', '.join(summary['conditions'])}",
              f"- 计划调用：{summary['callBudget']} 次",
              f"- 已记录结果：{summary['resultRows']} 条",
-             f"- 已评分行：{summary['scoredRows']} 行",
+             f"- 已评分行：{summary['scoredRows']} 行，另有 {summary['unmatchedScoreRows']} 行未匹配本轮有效输出",
+             f"- 本轮评分表：{scores_path.name if scores_path else '待生成成功输出'}",
              f"- 原始结果：{results_path.name if results_path else '未执行'}", ""]
     if not summary["resultRows"]:
         lines += ["> **执行状态：未进行真实模型调用。** 当前环境未提供 MODEL_API_KEY，"
                   "或尚未执行 `run_model_compare.py --live`。本文件不包含模型效果结论。", ""]
     if not summary["scoredRows"]:
-        lines += ["> **评分状态：待两位评分人填写 `scoring.csv`。** 空表不会被计为通过。", ""]
+        lines += ["> **评分状态：待取得成功输出并由两位评分人填写对应评分表。** 空表不会被计为通过。", ""]
 
     lines += ["## 各条件均分（0～2 分）", "",
               "| 条件 | " + " | ".join(dimensions) + " | 总均分 |",
@@ -165,11 +223,13 @@ def write_markdown(summary: dict, outdir: Path, results_path: Path | None, dimen
         lines.append(f"| {condition} | {values} | {'-' if total is None else f'{total:.2f}'} |")
     lines += ["", "## 配对比较（领域条件 vs 通用模型）", ""]
     paired = summary["paired"]
-    lines += [f"- 领域胜：{paired['wins']} 例；平：{paired['ties']} 例；负：{paired['losses']} 例。"]
     if paired["cases"]:
+        lines += [f"- 领域胜：{paired['wins']} 例；平：{paired['ties']} 例；负：{paired['losses']} 例。"]
         lines += ["", "| 案例 | 通用 | 领域 | 结果 |", "| --- | ---: | ---: | --- |"]
         for pair in paired["cases"]:
             lines.append(f"| {pair['caseId']} | {pair['baseline']:.2f} | {pair['domain']:.2f} | {pair['outcome']} |")
+    else:
+        lines.append("本轮暂无可配对的完整评分。")
     lines += ["", "## 评分一致性", "",
               "| 维度 | 完全一致 | 相差≤1 | 有效对数 |", "| --- | ---: | ---: | ---: |"]
     for dimension in dimensions:
@@ -190,20 +250,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scores", type=Path)
     args = parser.parse_args(argv)
     outdir = args.outdir
+    for supplied in (args.results, args.scores):
+        if supplied is not None and not supplied.is_file():
+            raise SystemExit(f"找不到指定文件：{supplied}")
     plan_path = args.plan or outdir / "model-compare-plan.json"
     if not plan_path.exists():
         raise SystemExit(f"缺少计划文件：{plan_path}；请先运行 run_model_compare.py")
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    outdir.mkdir(parents=True, exist_ok=True)
     dimensions = plan.get("dimensions") or []
     results_path = args.results or latest_results(outdir)
-    scores_path = args.scores or outdir / "scoring.csv"
     results = load_results(results_path)
-    scores = load_scores(scores_path, dimensions)
+    outputs = eligible_outputs(plan, results)
+    scores_path = args.scores
+    if scores_path is None and outputs:
+        scores_path = score_sheet(outdir, results_path, outputs, dimensions)
+    scores = load_scores(scores_path, dimensions) if scores_path else []
     summary = summarize(plan, results, scores, dimensions)
-    outputs = export_outputs(results, outdir)
+    outputs = export_outputs(results, outdir, results_path)
     summary_path = outdir / "model-compare-summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    markdown = write_markdown(summary, outdir, results_path, dimensions)
+    markdown = write_markdown(summary, outdir, results_path, dimensions, scores_path)
+    if scores_path:
+        print(f"本轮评分表：{scores_path}")
     print(f"汇总：{markdown}")
     print(f"JSON：{summary_path}")
     if outputs:

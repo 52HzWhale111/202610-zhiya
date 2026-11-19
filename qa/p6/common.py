@@ -160,6 +160,25 @@ class ApiSession:
         self.client.close()
 
 
+def select_story(client: ApiSession, items: list[dict], version_id: int | None) -> dict:
+    if version_id is not None:
+        response = client.get(f"/api/v1/story-versions/{version_id}")
+        if response.status_code == 404:
+            raise Blocked(f"指定绘本版本 {version_id} 不可用")
+        if response.status_code != 200:
+            raise AssertionError(f"读取指定绘本版本 {version_id} 返回 HTTP {response.status_code}")
+        story = response.json()["data"]
+        if story.get("storyVersionId") != version_id:
+            raise AssertionError(f"绘本详情返回的版本与指定版本 {version_id} 不一致")
+    else:
+        if not items:
+            raise Blocked("书架为空，请先准备已发布绘本")
+        story = next((item for item in items if len(item.get("pages", [])) >= 4), items[0])
+    if not story.get("pages"):
+        raise AssertionError("绘本详情没有页面")
+    return story
+
+
 def response_json(response: httpx.Response) -> Any:
     try:
         return response.json()
@@ -189,8 +208,10 @@ class Recorder:
         self.results: list[Result] = []
         self.meta: dict[str, Any] = {"startedAt": utc_now()}
 
-    def case(self, case_id: str, title: str, ac: str, fn: Callable[[], tuple[str, dict] | str | None]
-             ) -> Result:
+    def case(self, case_id: str, title: str, ac: str, fn: Callable[[], tuple[str, dict] | str | Warn | None],
+             *, blocked: str | None = None) -> Result:
+        if blocked:
+            return self.record(case_id, title, ac, BLOCKED, blocked)
         started = time.perf_counter()
         try:
             outcome = fn()

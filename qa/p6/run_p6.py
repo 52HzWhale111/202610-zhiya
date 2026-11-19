@@ -15,7 +15,9 @@ import subprocess
 import sys
 import time
 import urllib.request
+from http.client import HTTPException
 from pathlib import Path
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
@@ -29,15 +31,18 @@ def run(cmd: list[str], *, env: dict[str, str] | None = None) -> int:
     return completed.returncode
 
 
-def wait_health(base_url: str, timeout: float = 40.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+def wait_health(base_url: str, server: subprocess.Popen, instance: str, timeout: float = 40.0) -> bool:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    deadline = time.monotonic() + timeout
+    while server.poll() is None and time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(f"{base_url}/api/v1/health", timeout=2) as response:
-                if response.status == 200:
+            with opener.open(f"{base_url}/api/v1/health", timeout=2) as response:
+                if (response.status == 200 and response.headers.get("X-P6-Instance") == instance
+                        and server.poll() is None):
                     return True
-        except Exception:  # noqa: BLE001 - 启动期间连接失败是正常的
-            time.sleep(0.5)
+        except (OSError, HTTPException):
+            pass
+        time.sleep(0.2)
     return False
 
 
@@ -52,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--account")
     parser.add_argument("--password", default=os.environ.get("P6_ACCEPTANCE_PASSWORD", "P6-test-pass-2026"))
     parser.add_argument("--tested-commit", help="被测服务的 Git 提交，外部部署请显式提供")
+    parser.add_argument("--text-model-live", action="store_true", help="允许本地后端使用真实文本模型生成小结")
     voice = parser.add_mutually_exclusive_group()
     voice.add_argument("--voice-live", action="store_true", help="明确执行真实 TTS")
     voice.add_argument("--voice-expect-unconfigured", action="store_true", help="已确认目标服务禁用 TTS，验证 503")
@@ -68,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     base_url = args.base_url
     profile = args.profile or ("public" if base_url and base_url.startswith("https://") else "local")
     server: subprocess.Popen | None = None
+    instance = uuid4().hex
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
 
@@ -81,22 +88,24 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"数据库已存在：{args.db}（补充未发布的种子可手动运行 prepare_demo_data.py）")
         env["ZHIYA_DB_PATH"] = str(args.db.resolve())
+        if not args.text_model_live:
+            env["MODEL_API_KEY"] = ""
         if not args.voice_live:
             env["DASHSCOPE_API_KEY"] = ""
             env["TTS_API_URL"] = ""
         print(f"启动本地服务：{base_url}")
         server = subprocess.Popen(
             [args.python, "-m", "uvicorn", "app.main:create_app", "--factory",
-             "--app-dir", "backend", "--host", "127.0.0.1", "--port", str(args.port), "--no-access-log"],
+             "--app-dir", "backend", "--host", "127.0.0.1", "--port", str(args.port), "--no-access-log",
+             "--header", f"X-P6-Instance:{instance}"],
             cwd=ROOT, env=env,
         )
-        if not wait_health(base_url):
-            server.terminate()
-            print("服务在 40 秒内未就绪，已终止。", file=sys.stderr)
-            return 2
 
     code = 0
     try:
+        if server is not None and not wait_health(base_url, server, instance):
+            print("本次启动的服务未就绪，请检查端口和启动日志。", file=sys.stderr)
+            return 2
         if not args.skip_acceptance:
             cmd = [args.python, str(HERE / "run_acceptance.py"), "--base-url", base_url,
                    "--profile", profile, "--outdir", str(args.outdir)]
@@ -131,12 +140,13 @@ def main(argv: list[str] | None = None) -> int:
                                 "--acceptance", str(args.outdir / "acceptance-latest.json")], env=env)
             code = code or defects_code
     finally:
-        if server is not None:
+        if server is not None and server.poll() is None:
             server.terminate()
             try:
                 server.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 server.kill()
+                server.wait()
 
     latest = args.outdir / "acceptance-latest.json"
     if latest.exists():

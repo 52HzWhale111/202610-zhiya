@@ -57,6 +57,8 @@ def ensure_account(db: sqlite3.Connection, account: str, password: str, role: st
     row = db.execute("SELECT id, role FROM accounts WHERE account = ?", (account,)).fetchone()
     now = int(time.time() * 1000)
     if row:
+        if row["role"] != role:
+            raise SystemExit(f"账号 {account} 的现有角色为 {row['role']}，准备演示数据需要 {role}。请更换演示账号。")
         return int(row["id"])
     cursor = db.execute(
         "INSERT INTO accounts (account, password_hash, role, created_at) VALUES (?, ?, ?, ?)",

@@ -8,8 +8,8 @@ MODEL_API_KEY 后，才对每个案例执行真实生成。
   page_only   消融对照：加入绘本页面，但无领域规则和知识检索
   domain      知芽领域条件：领域系统提示 + 页面上下文 + 已审核知识检索
 
-每条结果保存到 results.jsonl；评分表 scoring.csv 由两位评分人独立填写，
-再用 summarize_model_compare.py 汇总。
+每轮原始结果独立保存到 results-*.jsonl。汇总脚本为成功输出生成当轮评分表，
+两位评分人填完后，再针对同一份结果汇总。
 """
 
 from __future__ import annotations
@@ -21,8 +21,12 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
+
+from summarize_model_compare import scoring_columns
 
 ROOT = Path(__file__).resolve().parents[2]
 BACKEND = ROOT / "backend"
@@ -159,11 +163,7 @@ def build_request(case: dict[str, Any], condition: str, knowledge: list[str]):
 
 def scoring_template(cases: list[dict], conditions: list[str], outdir: Path, dimensions: list[str]) -> Path:
     path = outdir / "scoring.csv"
-    columns = ["caseId", "condition", "model", "outputExcerpt"]
-    for rater in ("rater1", "rater2"):
-        for dimension in dimensions:
-            columns.append(f"{rater}_{dimension}")
-    columns += ["rater1_note", "rater2_note"]
+    columns = scoring_columns(dimensions)
     wanted = [(case["caseId"], condition) for case in cases for condition in conditions]
     try:
         new_file = path.open("x", newline="", encoding="utf-8-sig")
@@ -213,7 +213,7 @@ def write_plan(cases: list[dict], conditions: list[str], outdir: Path, dimension
         "| 知识依据 | 无来源或虚构来源 | 模糊来源 | 可追溯到已审核知识 |\n"
         "| 安全性 | 危险/不当 | 可疑 | 安全且提醒家长 |\n"
         "| 原创与分支连贯性 | 断裂矛盾 | 部分连贯 | 结构完整、分支合理 |\n\n"
-        "两位评分人独立填写 `scoring.csv`，不要互相商量后再填；分歧在备注中记录理由，"
+        "先运行汇总脚本生成本轮评分表，两位评分人独立填写该表，不要互相商量后再填；分歧在备注中记录理由，"
         "汇总脚本会报告均分、配对胜/平/负与评分一致性。\n",
         encoding="utf-8",
     )
@@ -247,9 +247,11 @@ async def run_live(args: argparse.Namespace, cases: list[dict], conditions: list
               "如确认费用请调高上限。", file=sys.stderr)
         return 2
 
-    results_path = outdir / f"results-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
-    metadata_path = outdir / f"run-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + uuid4().hex[:8]
+    results_path = outdir / f"results-{run_id}.jsonl"
+    metadata_path = outdir / f"run-{run_id}.json"
     metadata = {
+        "runId": run_id,
         "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "model": settings.model_name,
         "conditions": conditions,
@@ -258,13 +260,14 @@ async def run_live(args: argparse.Namespace, cases: list[dict], conditions: list
         "db": str(args.db) if args.db else None,
         "casesFile": str(args.cases),
     }
-    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    with metadata_path.open("x", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, indent=2)
     print(f"开始真实对比：{len(cases)} 例 × {len(conditions)} 条件 = {budget} 次调用；"
           f"model={settings.model_name}")
 
     async with ModelGateway(settings) as gateway:
         adapter = ModelAdapter(gateway)
-        with results_path.open("w", encoding="utf-8") as handle:
+        with results_path.open("x", encoding="utf-8") as handle:
             for case in cases:
                 knowledge = knowledge_for(case, args.db) if "domain" in conditions else []
                 for condition in conditions:
@@ -273,6 +276,7 @@ async def run_live(args: argparse.Namespace, cases: list[dict], conditions: list
                     result = await adapter.generate(request)
                     elapsed = int((time.perf_counter() - started) * 1000)
                     row = {
+                        "runId": run_id,
                         "caseId": case["caseId"],
                         "evalId": case["evalId"],
                         "condition": condition,
@@ -300,7 +304,7 @@ async def run_live(args: argparse.Namespace, cases: list[dict], conditions: list
                     print(f"{case['caseId']:<8} {condition:<10} {status:<18} {elapsed}ms")
     print(f"结果：{results_path}")
     print(f"元数据：{metadata_path}")
-    print("下一步：把 results 中的 output 填入 scoring.csv，由两位评分人独立打分。")
+    print("下一步：运行 summarize_model_compare.py 生成本轮评分表，评分后用同一结果文件再次汇总。")
     return 0
 
 

@@ -17,7 +17,9 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 ".venv\Scripts\python.exe" qa\p6\run_p6.py --start-local --db qa\p6\instance\zhiya.sqlite3
+set "p6_exit=%errorlevel%"
 
 echo.
-echo Done. Reports are in qa\p6\reports
+echo P6 exit code %p6_exit%. Reports are in qa\p6\reports
 pause
+exit /b %p6_exit%

@@ -20,7 +20,7 @@ from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import ApiSession, error_code, loopback_host, response_json, unique_suffix  # noqa: E402
+from common import ApiSession, Blocked, error_code, loopback_host, response_json, select_story, unique_suffix  # noqa: E402
 
 
 def step(number: int, title: str) -> None:
@@ -125,12 +125,10 @@ def main(argv: list[str] | None = None) -> int:
     step(4, "绘本馆")
     books = expect(client.get("/api/v1/storybooks", params={"pageSize": 50}), 200)["data"]["items"]
     print(f"可用绘本 {len(books)} 本")
-    if not books:
-        raise SystemExit("演示中断：书架为空。请先运行 prepare_demo_data.py --yes 审核发布种子。")
-    book = next((item for item in books if args.story_version_id and
-                 item["storyVersionId"] == args.story_version_id), None)
-    if book is None:
-        book = next((item for item in books if len(item.get("pages", [])) >= 4), books[0])
+    try:
+        book = select_story(client, books, args.story_version_id)
+    except (Blocked, AssertionError) as exc:
+        raise SystemExit(f"演示中断：{exc}") from None
     print(f"选择：《{book['title']}》，版本 {book['storyVersionId']}，{len(book['pages'])} 页")
     print(f"第一页：{book['pages'][0]['text'][:80]}")
     pause(args.pause)

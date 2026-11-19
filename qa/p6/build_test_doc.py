@@ -71,7 +71,7 @@ def detail_table(results: list[dict]) -> str:
 
 STATES = {"PASS": "通过", "FAIL": "失败", "BLOCKED": "阻塞", "SKIP": "跳过", "WARN": "警告"}
 PARTIAL_SCOPE = {"AC-04": "浏览器端到端", "AC-07": "实际语音质量与前端",
-                 "AC-10": "模型与语音超时", "AC-12": "浏览器儿童模式"}
+                 "AC-09": "活动与故事的相关性", "AC-10": "模型与语音超时", "AC-12": "浏览器儿童模式"}
 
 
 def cell(value: str) -> str:

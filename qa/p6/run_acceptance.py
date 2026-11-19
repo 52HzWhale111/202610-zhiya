@@ -39,6 +39,7 @@ from common import (
     loopback_host,
     loopback_http,
     response_json,
+    select_story,
     unique_suffix,
     write_reports,
 )
@@ -68,7 +69,7 @@ SECURITY_HEADERS = {
 }
 
 
-class RateLimited(Exception):
+class RateLimited(Blocked):
     """登录限流（429）不是功能失败，但会阻断依赖登录的用例。"""
 
 
@@ -187,38 +188,31 @@ class Acceptance:
 
     # ---------- 账号与授权 ----------
 
-    def test_registration(self) -> tuple[str, dict]:
-        suffix = unique_suffix()
-        account = self.args.account or f"p6a{suffix}"
-        password = self.args.password
-        if self.args.account:
-            self.rec.record("TC-P6-AUTH-001", "注册新账号", "AC-01", SKIP,
-                            "使用已有演示账号，跳过注册；如需验证注册请不传 --account")
-        else:
-            response = self.register(self.a, account, password)
-            body = expect(response, 201, label="注册")
-            expect_envelope(body, response, "注册")
-            if not body.get("data", {}).get("accountId"):
-                raise AssertionError("注册响应缺少 accountId")
-            self.rec.record("TC-P6-AUTH-001", "注册新账号", "AC-01", PASS,
-                            f"account={account}，201 且返回 accountId")
-            # 重复账号
-            duplicate = self.register(self.anon, account, password)
-            expect(duplicate, 409, "ACCOUNT_EXISTS", "重复注册")
-            self.rec.record("TC-P6-AUTH-002", "重复账号注册被拒绝", "AC-01", PASS,
-                            "409 ACCOUNT_EXISTS")
-        # 错误密码
-        wrong = ApiSession(self.args.base_url, timeout=self.args.timeout,
-                           verify=not self.args.insecure_tls, allow_insecure_cookies=self.args.allow_http)
+    def test_registration(self) -> str:
+        response = self.register(self.a, self.account, self.password)
+        body = expect(response, 201, label="注册")
+        expect_envelope(body, response, "注册")
+        if not body.get("data", {}).get("accountId"):
+            raise AssertionError("注册响应缺少 accountId")
+        return "201 且返回 accountId"
+
+    def test_duplicate_registration(self) -> str:
+        duplicate = self.register(self.anon, self.account, self.password)
+        expect(duplicate, 409, "ACCOUNT_EXISTS", "重复注册")
+        return "409 ACCOUNT_EXISTS"
+
+    def test_wrong_password(self) -> str:
+        client = ApiSession(self.args.base_url, timeout=self.args.timeout, verify=not self.args.insecure_tls,
+                            allow_insecure_cookies=self.args.allow_http)
         try:
-            bad = self.login(wrong, account, "wrong-password-000")
+            bad = self.login(client, self.account, "wrong-password-000")
             expect(bad, 401, "INVALID_CREDENTIALS", "错误密码登录")
-            self.rec.record("TC-P6-AUTH-003", "错误密码登录被拒绝", "AC-01", PASS,
-                            "401 INVALID_CREDENTIALS")
+            return "401 INVALID_CREDENTIALS"
         finally:
-            wrong.close()
-        # 正确登录，主会话
-        response = self.login(self.a, account, password)
+            client.close()
+
+    def test_login(self) -> tuple[str, dict]:
+        response = self.login(self.a, self.account, self.password)
         body = expect(response, 201, label="登录")
         expect_envelope(body, response, "登录")
         session_flags = cookie_flags(response, "zhiya_session")
@@ -227,9 +221,22 @@ class Acceptance:
             raise AssertionError(f"会话 Cookie 属性不符：{session_flags}")
         if not csrf_flags["secure"] or not csrf_flags["sameSiteLax"] or csrf_flags["httpOnly"]:
             raise AssertionError(f"CSRF Cookie 属性不符：{csrf_flags}")
-        self.account = account
-        self.password = password
-        return f"account={account}", {"cookieFlags": {"session": session_flags, "csrf": csrf_flags}}
+        return f"account={self.account}", {"cookieFlags": {"session": session_flags, "csrf": csrf_flags}}
+
+    def prepare_second_account(self) -> str:
+        args = self.args
+        account = args.account_b or f"p6b{unique_suffix()}"
+        client = ApiSession(args.base_url, timeout=args.timeout, verify=not args.insecure_tls,
+                            allow_insecure_cookies=args.allow_http)
+        try:
+            if not args.account_b:
+                expect(self.register(client, account, args.password_b), 201, label="账号 B 注册")
+            expect(self.login(client, account, args.password_b), 201, label="账号 B 登录")
+        except Exception:
+            client.close()
+            raise
+        self.b = client
+        return "第二账号已登录"
 
     def test_anonymous_protected(self) -> str:
         response = self.anon.get("/api/v1/child-profiles")
@@ -247,11 +254,13 @@ class Acceptance:
                 raise Blocked(str(exc)) from None
             response = client.delete("/api/v1/auth/sessions/current", csrf=True)
             expect(response, 204, label="退出")
+            if client.session_cookie is not None or client.csrf is not None:
+                raise AssertionError("退出响应未清除客户端认证 Cookie")
             after = client.get("/api/v1/child-profiles")
             expect(after, 401, "AUTH_REQUIRED", "退出后访问")
         finally:
             client.close()
-        return "退出 204，旧会话失效"
+        return "退出返回 204，客户端 Cookie 已清除，匿名访问返回 401"
 
     # ---------- 档案 ----------
 
@@ -326,13 +335,7 @@ class Acceptance:
             raise AssertionError(
                 f"可用绘本 {len(items)} 本，少于 AC-03 要求的 {self.args.min_storybooks} 本；"
                 "本地请先运行 prepare_demo_data.py --yes 审核发布种子")
-        story = None
-        if self.args.story_version_id:
-            story = next((item for item in items if item["storyVersionId"] == self.args.story_version_id), None)
-        if story is None:
-            story = next((item for item in items if len(item.get("pages", [])) >= 4), items[0])
-        if not story.get("pages"):
-            raise AssertionError("绘本详情没有页面")
+        story = select_story(self.a, items, self.args.story_version_id)
         self.story = story
         return f"可用绘本 {len(items)} 本，选用 {story['title']}（v{story['storyVersionId']}）", {
             "storybookCount": len(items), "storyVersionId": story["storyVersionId"]}
@@ -505,15 +508,37 @@ class Acceptance:
         report = data.get("report")
         if not isinstance(report, dict):
             raise AssertionError("结束后没有返回小结")
-        status = report.get("status")
-        activities = report.get("activities") or []
         self.report = report
-        detail = f"status={status}, activities={len(activities)}"
-        if status == "READY" and not activities:
-            return detail + "（FR-10/AC-09 活动仍为空，记警告）", {"reportStatus": status}
-        if status in ("PENDING", "FAILED"):
-            return detail + "（模型未配置或生成失败，记警告）", {"reportStatus": status}
-        return detail, {"reportStatus": status}
+        return f"会话已结束，首次小结状态 {report.get('status')}", {"initialReportStatus": report.get("status")}
+
+    def test_report_status(self) -> str | Warn:
+        deadline = time.monotonic() + self.args.timeout
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            response = self.a.get(f"/api/v1/reading-sessions/{self.session_id}", timeout=max(remaining, 0.001))
+            report = expect(response, 200, label="读取最终小结")["data"]["report"]
+            if not isinstance(report, dict) or report.get("status") not in {"PENDING", "READY", "FAILED"}:
+                raise AssertionError("会话详情缺少有效的小结状态")
+            self.report = report
+            if report["status"] == "READY":
+                return "详情中的小结已就绪"
+            if report["status"] == "FAILED":
+                return Warn("详情中的小结生成失败", {"reportStatus": "FAILED"})
+            time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+        raise Blocked("等待小结终态超时，最近一次观测为 PENDING")
+
+    def test_activities(self) -> str:
+        activities = self.report.get("activities")
+        if activities == []:
+            raise Blocked("已就绪的小结中尚无亲子活动")
+        if not isinstance(activities, list) or not activities:
+            raise AssertionError("小结缺少活动数组")
+        for activity in activities:
+            for key in ("materials", "steps"):
+                values = activity.get(key) if isinstance(activity, dict) else None
+                if not isinstance(values, list) or not values or not all(isinstance(v, str) and v.strip() for v in values):
+                    raise AssertionError(f"亲子活动缺少有效的 {key}")
+        return f"{len(activities)} 项活动均含材料与步骤，内容相关性待人工复核"
 
     def test_history(self) -> str:
         response = self.a.get("/api/v1/reading-sessions", params={"pageSize": 50})
@@ -744,83 +769,65 @@ class Acceptance:
         self.rec.case("TC-P6-API-002", "未知路由错误结构", "FR-12", self.test_unknown_route)
         self.rec.case("TC-P6-API-003", "方法不允许错误结构", "FR-12", self.test_method_not_allowed)
 
-        setup_ok = True
-        try:
-            detail, evidence = self.test_registration()
-            self.rec.record("TC-P6-AUTH-004", "登录成功与 Cookie 安全属性", "AC-01", PASS, detail, evidence)
-        except RateLimited as exc:
-            self.rec.record("TC-P6-AUTH-004", "登录成功与 Cookie 安全属性", "AC-01", BLOCKED, str(exc))
-            setup_ok = False
-        except Exception as exc:  # noqa: BLE001
-            self.rec.record("TC-P6-AUTH-004", "登录成功与 Cookie 安全属性", "AC-01", FAIL, str(exc))
-            setup_ok = False
-        if not setup_ok:
-            for case_id, title, ac in (
-                    ("TC-P6-AUTH-005", "匿名访问受保护接口", "AC-01"),
-                    ("TC-P6-PROF-001", "创建并读取幼儿档案", "AC-02"),
-                    ("TC-P6-BOOK-001", "绘本列表至少 8 本", "AC-03"),
-            ):
-                self.rec.record(case_id, title, ac, BLOCKED, "登录前置失败")
-            return self._finish()
-
-        self.rec.case("TC-P6-AUTH-005", "匿名访问受保护接口", "AC-01", self.test_anonymous_protected)
-        self.rec.case("TC-P6-AUTH-006", "退出后旧会话失效", "AC-01", self.test_logout)
-
-        # 账号 B：跨账号隔离
-        try:
-            suffix = unique_suffix()
-            account_b = args.account_b or f"p6b{suffix}"
-            password_b = args.password_b
-            self.b = ApiSession(args.base_url, timeout=args.timeout, verify=not args.insecure_tls,
-                                allow_insecure_cookies=args.allow_http)
-            if not args.account_b:
-                expect(self.register(self.b, account_b, password_b), 201, label="账号 B 注册")
-            expect(self.login(self.b, account_b, password_b), 201, label="账号 B 登录")
-        except Exception as exc:  # noqa: BLE001
-            self.rec.record("TC-P6-AUTH-007", "第二账号建立", "AC-01", BLOCKED, str(exc))
-            self.b = None
-
-        self.rec.case("TC-P6-PROF-001", "创建并读取幼儿档案", "AC-02", self.test_profile_create)
-        self.rec.case("TC-P6-PROF-002", "修改档案并持久化", "AC-02", self.test_profile_update)
-        self.rec.case("TC-P6-PROF-003", "档案字段校验", "AC-02", self.test_profile_validation)
-        if self.b is not None:
-            self.rec.case("TC-P6-PROF-004", "跨账号档案隔离", "NFR-04", self.test_cross_account_profile)
-
-        self.rec.case("TC-P6-BOOK-001", "绘本列表至少 8 本", "AC-03", self.test_storybook_list)
-        self.rec.case("TC-P6-BOOK-002", "绘本筛选与分页边界", "AC-03", self.test_storybook_filters)
-        self.rec.case("TC-P6-BOOK-003", "绘本详情与越界访问", "AC-04", self.test_storybook_detail)
-        if getattr(self, "profile", None):
-            self.rec.case("TC-P6-REC-001", "绘本推荐与理由", "AC-03", self.test_recommendation)
-
-        if getattr(self, "story", None) and getattr(self, "profile", None):
-            self.rec.case("TC-P6-SESS-001", "创建阅读会话与 CSRF", "AC-08", self.test_session_create)
-            if getattr(self, "session_id", None):
-                self.rec.case("TC-P6-SESS-002", "开始阅读、幂等与冲突", "AC-08", self.test_session_events)
-                self.rec.case("TC-P6-SESS-003", "翻页与进度持久化", "AC-04", self.test_page_change)
-                if self.b is not None:
-                    self.rec.case("TC-P6-SESS-004", "跨账号会话隔离", "NFR-04", self.test_cross_account_session)
-                self.rec.case("TC-P6-BRANCH-001", "受控故事分支选择", "AC-14", self.test_branch_choice)
-                self.rec.case("TC-P6-SESS-005", "结束阅读与小结", "AC-08", self.test_finish_and_report)
-                self.rec.case("TC-P6-SESS-006", "阅读历史可查询", "AC-08", self.test_history)
-                self.rec.case("TC-P6-SESS-007", "结束后禁止继续写入", "AC-10", self.test_event_after_finish)
-                self.rec.case("TC-P6-SESS-008", "删除本人阅读记录", "FR-14", self.test_delete_session)
+        case = self.rec.case
+        self.account = args.account or f"p6a{unique_suffix()}"
+        self.password = args.password
+        registration_block = None
+        if args.account:
+            self.rec.record("TC-P6-AUTH-001", "注册新账号", "AC-01", SKIP, "使用已有演示账号")
+            self.rec.record("TC-P6-AUTH-002", "重复账号注册被拒绝", "AC-01", SKIP, "使用已有演示账号")
         else:
-            for case_id, title, ac in (
-                    ("TC-P6-SESS-001", "创建阅读会话与 CSRF", "AC-08"),
-                    ("TC-P6-SESS-002", "开始阅读、幂等与冲突", "AC-08"),
-                    ("TC-P6-SESS-005", "结束阅读与小结", "AC-08"),
-            ):
-                self.rec.record(case_id, title, ac, BLOCKED, "缺少档案或可用绘本")
+            registered = case("TC-P6-AUTH-001", "注册新账号", "AC-01", self.test_registration)
+            if registered.status != PASS:
+                registration_block = "测试账号注册失败"
+            case("TC-P6-AUTH-002", "重复账号注册被拒绝", "AC-01", self.test_duplicate_registration,
+                 blocked=registration_block)
+        wrong = case("TC-P6-AUTH-003", "错误密码登录被拒绝", "AC-01", self.test_wrong_password,
+                     blocked=registration_block)
+        login = case("TC-P6-AUTH-004", "登录成功与 Cookie 安全属性", "AC-01", self.test_login,
+                     blocked=wrong.detail if wrong.status == BLOCKED else registration_block)
+        auth_block = None if login.status == PASS else "主账号未登录：" + login.detail
+        case("TC-P6-AUTH-005", "匿名访问受保护接口", "AC-01", self.test_anonymous_protected)
+        case("TC-P6-AUTH-006", "退出后客户端清除 Cookie", "AC-01", self.test_logout, blocked=auth_block)
+        second = case("TC-P6-AUTH-007", "第二账号建立", "AC-01", self.prepare_second_account, blocked=auth_block)
+        second_block = None if second.status == PASS else "第二账号未就绪"
 
-        if getattr(self, "session_id", None):
-            self.rec.case("TC-P6-CHILD-001", "儿童模式授权与家长解锁", "AC-12", self.test_child_mode)
-            self.rec.case("TC-P6-VOICE-001", "语音接口鉴权", "AC-07", self.test_voice_auth)
-            self.rec.case("TC-P6-VOICE-002", "语音格式与未配置回退", "AC-07", self.test_voice_validation)
-        else:
-            self.rec.record("TC-P6-CHILD-001", "儿童模式授权与家长解锁", "AC-12", BLOCKED, "缺少可用会话")
-            self.rec.record("TC-P6-VOICE-001", "语音接口鉴权", "AC-07", BLOCKED, "缺少可用会话")
+        profile = case("TC-P6-PROF-001", "创建并读取幼儿档案", "AC-02", self.test_profile_create, blocked=auth_block)
+        profile_block = None if profile.status == PASS else "缺少可用档案"
+        case("TC-P6-PROF-002", "修改档案并持久化", "AC-02", self.test_profile_update, blocked=profile_block)
+        case("TC-P6-PROF-003", "档案字段校验", "AC-02", self.test_profile_validation, blocked=profile_block)
+        case("TC-P6-PROF-004", "跨账号档案隔离", "NFR-04", self.test_cross_account_profile,
+             blocked=profile_block or second_block)
 
-        self.rec.case("TC-P6-NFR-001", "接口响应时间抽测", "NFR-03", self.test_performance)
+        book = case("TC-P6-BOOK-001", "绘本列表至少 8 本", "AC-03", self.test_storybook_list, blocked=auth_block)
+        book_block = None if book.status == PASS else "缺少选定绘本"
+        case("TC-P6-BOOK-002", "绘本筛选与分页边界", "AC-03", self.test_storybook_filters, blocked=auth_block)
+        case("TC-P6-BOOK-003", "绘本详情与越界访问", "AC-04", self.test_storybook_detail, blocked=book_block)
+        case("TC-P6-REC-001", "绘本推荐与理由", "AC-03", self.test_recommendation, blocked=profile_block)
+
+        reading_block = profile_block or book_block
+        session = case("TC-P6-SESS-001", "创建阅读会话与 CSRF", "AC-08", self.test_session_create, blocked=reading_block)
+        session_block = None if session.status == PASS else "缺少可用会话"
+        started = case("TC-P6-SESS-002", "开始阅读、幂等与冲突", "AC-08", self.test_session_events, blocked=session_block)
+        start_block = None if started.status == PASS else "阅读尚未开始"
+        case("TC-P6-SESS-003", "翻页与进度持久化", "AC-04", self.test_page_change, blocked=start_block)
+        case("TC-P6-SESS-004", "跨账号会话隔离", "NFR-04", self.test_cross_account_session,
+             blocked=session_block or second_block)
+        case("TC-P6-BRANCH-001", "受控故事分支选择", "AC-14", self.test_branch_choice, blocked=reading_block)
+        finished = case("TC-P6-SESS-005", "结束阅读与小结", "AC-08", self.test_finish_and_report, blocked=start_block)
+        finish_block = None if finished.status == PASS else "缺少已结束的会话"
+        case("TC-P6-SESS-006", "阅读历史可查询", "AC-08", self.test_history, blocked=finish_block)
+        case("TC-P6-SESS-007", "结束后禁止继续写入", "AC-10", self.test_event_after_finish, blocked=finish_block)
+        case("TC-P6-SESS-008", "删除本人阅读记录", "FR-14", self.test_delete_session, blocked=reading_block)
+        report = case("TC-P6-REPORT-001", "小结生成状态", "FR-09", self.test_report_status, blocked=finish_block)
+        case("TC-P6-ACT-001", "亲子活动材料与步骤", "AC-09", self.test_activities,
+             blocked=None if report.status == PASS else "小结未就绪：" + report.detail)
+
+        case("TC-P6-CHILD-001", "儿童模式授权与家长解锁", "AC-12", self.test_child_mode, blocked=reading_block)
+        voice = case("TC-P6-VOICE-001", "语音接口鉴权", "AC-07", self.test_voice_auth, blocked=reading_block)
+        case("TC-P6-VOICE-002", "语音格式与未配置回退", "AC-07", self.test_voice_validation,
+             blocked=None if voice.status == PASS else "语音测试会话未就绪")
+        case("TC-P6-NFR-001", "接口响应时间抽测", "NFR-03", self.test_performance, blocked=auth_block)
         self.rec.case("TC-P6-SEC-001", "安全响应头检查", "NFR-04", self.test_security_headers)
         self.rec.case("TC-P6-API-004", "接口契约覆盖情况", "NFR-07", self.test_openapi_coverage)
         if args.frontend_url:
@@ -857,24 +864,12 @@ class Acceptance:
                  pending("/api/v1/reading-sessions/{session_id}/guidance")),
                 ("TC-P6-AGENT-003", "原创故事生成与审核 AC-13/15", "AC-13",
                  pending("/api/v1/story-generations", "/api/v1/story-versions/{version_id}/approvals")),
-                ("TC-P6-ACT-001", "亲子活动材料与步骤 AC-09", "AC-09",
-                 "本轮未验收活动材料与步骤"),
         ):
             self.rec.record(case_id, title, ac, BLOCKED, reason)
 
-        return self._finish()
+        return self._finish(core_blocked=finished.status == BLOCKED)
 
-    def _finish(self) -> int:
-        # 报告生成后小结可能仍为 PENDING；补记一条可复核的警告
-        report = getattr(self, "report", None)
-        if report is not None:
-            if report.get("status") in ("PENDING", "FAILED"):
-                self.rec.record("TC-P6-REPORT-001", "小结生成状态", "FR-09", WARN,
-                                f"report.status={report.get('status')}；"
-                                "未配置文本模型时按 FAILED 保留事实摘要，属预期降级")
-            elif not (report.get("activities") or []):
-                self.rec.record("TC-P6-REPORT-001", "小结生成状态", "FR-09", WARN,
-                                "READY 但 activities 为空；FR-10/AC-09 仍未完成")
+    def _finish(self, *, core_blocked: bool = False) -> int:
         summary = self.rec.summary()
         paths = write_reports(self.rec, self.args.outdir, title="知芽 P6 黑盒验收测试报告")
         print("\n" + "=" * 60)
@@ -882,7 +877,9 @@ class Acceptance:
         for key, path in paths.items():
             print(f"{key}: {path}")
         print("=" * 60)
-        return 1 if summary["counts"][FAIL] else 0
+        if summary["counts"][FAIL]:
+            return 1
+        return 2 if core_blocked else 0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

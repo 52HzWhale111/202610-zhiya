@@ -7,7 +7,7 @@ import sqlite3
 import sys
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import httpx
 import pytest
@@ -204,11 +204,23 @@ def test_equal_raters_and_partial_scores():
     plan = {"caseCount": 1, "callBudget": 2, "conditions": ["baseline", "domain"]}
     scores = [dict(caseId="C", condition=c, rater1_x=a, rater2_x=b)
               for c, a, b in [("baseline", 2, 0), ("domain", 0, 2)]]
-    result = summarize_model_compare.summarize(plan, [], scores, ["x"])
+    results = [dict(caseId="C", condition=c, runId="run-A", model="fixture", success=True, output=c)
+               for c in plan["conditions"]]
+    for row, output in zip(scores, results):
+        row["outputKey"] = summarize_model_compare.output_key(output)
+    for unscorable in ([], [dict(row, success=False) for row in results],
+                       [dict(row, runId="run-B") for row in results], [dict(row, output="changed") for row in results],
+                       [results[0], dict(results[1], runId="run-B")]):
+        rejected = summarize_model_compare.summarize(plan, unscorable, scores, ["x"])
+        assert rejected["scoredRows"] == 0 and not rejected["paired"]["cases"]
+    result = summarize_model_compare.summarize(plan, results, scores, ["x"])
     assert result["scoredRows"] == 2
     assert result["paired"]["cases"] == [{"caseId": "C", "baseline": 1, "domain": 1, "outcome": "平"}]
+    other_model = [results[0], dict(results[1], model="other")]
+    other_scores = [scores[0], dict(scores[1], outputKey=summarize_model_compare.output_key(other_model[1]))]
+    assert not summarize_model_compare.summarize(plan, other_model, other_scores, ["x"])["paired"]["cases"]
     scores[0]["rater2_x"] = None
-    partial = summarize_model_compare.summarize(plan, [], scores, ["x"])
+    partial = summarize_model_compare.summarize(plan, results, scores, ["x"])
     assert partial["scoredRows"] == 2 and not partial["paired"]["cases"]
 
 
@@ -241,3 +253,147 @@ def test_committed_archives_honestly_record_branch_scope_and_cookie_flags():
         if path.name == "acceptance-20261118-212206.json":
             branch = next(r for r in report["results"] if r["case_id"] == "TC-P6-BRANCH-001")
             assert branch["status"] == "WARN" and "无环" in branch["detail"]
+
+
+
+def test_bound_scoring_sheet_preserves_each_run(tmp_path):
+    assert run_model_compare.main(["--outdir", str(tmp_path), "--limit", "1"]) == 0
+    plan = json.loads((tmp_path / "model-compare-plan.json").read_text("utf-8"))
+    case_id = plan["cases"][0]["caseId"]
+    def report(run):
+        path = tmp_path / f"results-{run}.jsonl"
+        rows = [dict(caseId=case_id, condition=c, model="fixture", success=True, output="sample")
+                for c in plan["conditions"]]
+        path.write_text("\n".join(json.dumps(row) for row in rows), "utf-8")
+        return ["--outdir", str(tmp_path), "--results", str(path)]
+
+    first = report("A")
+    assert summarize_model_compare.main(first) == 0
+    sheet = next(tmp_path.glob("scoring-A-*.csv"))
+    with sheet.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        columns, rows = reader.fieldnames, list(reader)
+    for row in rows:
+        for rater in ("rater1", "rater2"):
+            for dimension in plan["dimensions"]:
+                row[f"{rater}_{dimension}"] = "2"
+    with sheet.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+    saved = sheet.read_bytes()
+    assert summarize_model_compare.main(first) == 0
+    summary = tmp_path / "model-compare-summary.json"
+    assert json.loads(summary.read_text("utf-8"))["paired"]["ties"] == 1
+    second = report("B")
+    assert summarize_model_compare.main(second) == 0
+    assert json.loads(summary.read_text("utf-8"))["scoredRows"] == 0
+    assert summarize_model_compare.main([*second, "--scores", str(sheet)]) == 0
+    assert json.loads(summary.read_text("utf-8"))["unmatchedScoreRows"] == 2
+    assert sheet.read_bytes() == saved
+
+
+@pytest.mark.parametrize("allow_model", [False, True])
+def test_local_runner_only_uses_its_own_service(tmp_path, monkeypatch, allow_model):
+    server = Mock()
+    server.poll.side_effect = [None, 1, 1]
+    launcher = Mock(return_value=server)
+    monkeypatch.setattr(run_p6.subprocess, "Popen", launcher)
+    monkeypatch.setenv("MODEL_API_KEY", "fixture-only-marker")
+    response = MagicMock()
+    response.__enter__.return_value.status = 200
+    response.__enter__.return_value.headers = {"X-P6-Instance": "another-run"}
+    opener = Mock()
+    opener.open.return_value = response
+    monkeypatch.setattr(run_p6.urllib.request, "build_opener", lambda *args: opener)
+    monkeypatch.setattr(run_p6.time, "sleep", lambda _: None)
+    run = Mock()
+    monkeypatch.setattr(run_p6, "run", run)
+    flags = ["--text-model-live"] if allow_model else []
+    assert run_p6.main(["--start-local", "--skip-prepare", "--outdir", str(tmp_path), *flags]) == 2
+    run.assert_not_called()
+    assert launcher.call_args.kwargs["env"]["MODEL_API_KEY"] == ("fixture-only-marker" if allow_model else "")
+    server.poll.side_effect = None
+    server.poll.return_value = None
+    response.__enter__.return_value.headers = {"X-P6-Instance": "this-run"}
+    assert run_p6.wait_health("http://127.0.0.1", server, "this-run")
+
+
+def test_rate_limited_login_preserves_full_report_and_independent_checks(tmp_path, monkeypatch):
+    client = Mock()
+    client.post.return_value = httpx.Response(429)
+    monkeypatch.setattr(run_acceptance, "ApiSession", Mock(return_value=client))
+    independent = ("test_health", "test_unknown_route", "test_method_not_allowed", "test_anonymous_protected",
+                   "test_security_headers", "test_openapi_coverage", "test_frontend", "test_public_tls", "test_http_redirect")
+    for name in independent:
+        monkeypatch.setattr(run_acceptance.Acceptance, name, Mock(return_value="fixture"))
+    result = run_acceptance.main(["--profile", "public", "--base-url", "https://fixture.example", "--account", "fixture",
+                                  "--http-url", "http://fixture.example", "--frontend-url", "https://fixture.example",
+                                  "--outdir", str(tmp_path)])
+    assert result == 2
+    rows = json.loads((tmp_path / "acceptance-latest.json").read_text("utf-8"))["results"]
+    statuses = {row["case_id"]: row["status"] for row in rows}
+    assert len(rows) == len(statuses) == 42
+    for name in independent:
+        getattr(run_acceptance.Acceptance, name).assert_called_once()
+    assert all(statuses[key] == "BLOCKED" for key in ("TC-P6-AUTH-004", "TC-P6-SESS-005", "TC-P6-REPORT-001"))
+    assert statuses["TC-P6-PUB-001"] == statuses["TC-P6-PUB-002"] == "PASS"
+
+
+def test_report_reads_terminal_state_and_activity_fields(monkeypatch):
+    acceptance = run_acceptance.Acceptance.__new__(run_acceptance.Acceptance)
+    acceptance.args = run_acceptance.parse_args([])
+    acceptance.session_id = 4
+    acceptance.a = Mock()
+    def reply(status, activities):
+        return httpx.Response(200, json={"data": {"report": {"status": status, "activities": activities}}})
+    activity = {"materials": ["纸"], "steps": ["画一幅图"]}
+    acceptance.a.get.side_effect = [reply("PENDING", []), reply("READY", [activity])]
+    monkeypatch.setattr(run_acceptance.time, "sleep", lambda _: None)
+    assert "就绪" in acceptance.test_report_status()
+    assert "1 项活动" in acceptance.test_activities()
+    assert acceptance.a.get.call_count == 2
+    acceptance.report["activities"] = [{"materials": [], "steps": ["画一幅图"]}]
+    with pytest.raises(AssertionError, match="materials"):
+        acceptance.test_activities()
+    acceptance.a.get.side_effect = [reply("FAILED", [])]
+    assert isinstance(acceptance.test_report_status(), common.Warn)
+    acceptance.a.get.side_effect = None
+    acceptance.a.get.return_value = reply("PENDING", [])
+    acceptance.args.timeout = 0.002
+    with pytest.raises(common.Blocked, match="超时"):
+        acceptance.test_report_status()
+
+
+def test_pinned_story_never_falls_back_to_first_page():
+    books = [{"storyVersionId": 2, "pages": [1, 2, 3, 4]}]
+    client = Mock()
+    assert common.select_story(client, books, None) == books[0]
+    client.get.assert_not_called()
+    client.get.return_value = httpx.Response(404, json={})
+    with pytest.raises(common.Blocked, match="99"):
+        common.select_story(client, books, 99)
+    client.get.assert_called_once_with("/api/v1/story-versions/99")
+    client.get.return_value = httpx.Response(200, json={"data": {"storyVersionId": 99, "pages": [1]}})
+    assert common.select_story(client, books, 99)["storyVersionId"] == 99
+
+
+def test_defect_ids_identify_the_whole_case():
+    cases = [case("TC-P6-API-001"), case("TC-P6-PROF-001")]
+    defects = track_defects.auto_defects({"results": cases}, track_defects.load_manual(track_defects.DEFAULT_MANUAL))
+    assert {d["id"] for d in defects} == {"DEF-P6-AUTO-API-001", "DEF-P6-AUTO-PROF-001"}
+
+
+@pytest.mark.parametrize(("account", "role"), [("fixture-admin", "GUARDIAN"), ("fixture", "ADMIN")])
+def test_demo_role_conflict_rolls_back(tmp_path, monkeypatch, account, role):
+    path = tmp_path / "demo.sqlite3"
+    demo.ensure_database(path)
+    with closing(demo.connect(path)) as db, db:
+        demo.ensure_account(db, account, "fixture-password", role)
+    monkeypatch.setattr(sys, "argv", ["prepare_demo_data.py", "--db", str(path), "--account", "fixture", "--yes"])
+    with pytest.raises(SystemExit, match="现有角色"):
+        demo.main()
+    with closing(demo.connect(path)) as db:
+        rows = db.execute("SELECT account, role FROM accounts WHERE account LIKE 'fixture%'").fetchall()
+        assert [tuple(row) for row in rows] == [(account, role)]
+        assert db.execute("SELECT count(*) FROM story_versions WHERE status='PUBLISHED'").fetchone()[0] == 0
