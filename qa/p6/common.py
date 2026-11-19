@@ -282,7 +282,7 @@ def _md_escape(text: str) -> str:
 
 def write_reports(recorder: Recorder, outdir: Path, *, title: str = "知芽 P6 验收测试报告") -> dict[str, Path]:
     outdir.mkdir(parents=True, exist_ok=True)
-    suffix = stamp()
+    suffix = f"{stamp()}-{secrets.token_hex(16)}"
     summary = recorder.summary()
     payload = {"title": title, "meta": {**recorder.meta, **summary}, "results": [r.to_dict() for r in recorder.results]}
 
@@ -290,7 +290,6 @@ def write_reports(recorder: Recorder, outdir: Path, *, title: str = "知芽 P6 �
     latest_json = outdir / "acceptance-latest.json"
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     json_path.write_text(text, encoding="utf-8")
-    latest_json.write_text(text, encoding="utf-8")
 
     md_lines = [
         f"# {title}",
@@ -326,7 +325,6 @@ def write_reports(recorder: Recorder, outdir: Path, *, title: str = "知芽 P6 �
     latest_md = outdir / "acceptance-latest.md"
     md_text = "\n".join(md_lines) + "\n"
     md_path.write_text(md_text, encoding="utf-8")
-    latest_md.write_text(md_text, encoding="utf-8")
 
     suite = ET.Element("testsuite", {
         "name": title,
@@ -348,6 +346,15 @@ def write_reports(recorder: Recorder, outdir: Path, *, title: str = "知芽 P6 �
             ET.SubElement(case, "skipped", {"type": result.status, "message": result.detail})
     xml_path = outdir / f"acceptance-{suffix}.xml"
     ET.ElementTree(suite).write(xml_path, encoding="utf-8", xml_declaration=True)
+
+    # 三种归档写完才更新 latest。并发读取者始终获得完整的单个文件。
+    for target, content in ((latest_json, text), (latest_md, md_text)):
+        temporary = outdir / f".{suffix}-{target.name}.tmp"
+        try:
+            temporary.write_text(content, encoding="utf-8")
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     return {"json": json_path, "markdown": md_path, "junit": xml_path,
             "latestJson": latest_json, "latestMarkdown": latest_md}

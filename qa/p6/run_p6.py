@@ -49,7 +49,8 @@ def wait_health(base_url: str, server: subprocess.Popen, instance: str, timeout:
 def local_revision(root: Path) -> str | None:
     # 只检查本地服务、数据准备和验收使用的输入，报告目录属于运行输出。
     inputs = ["backend/app", "backend/requirements.txt", "database/schema.sql", "database/migrations",
-              ":(glob)database/*.py", "data/seed", ":(glob)qa/p6/*.py", "qa/p6/model_cases.json"]
+              ":(glob)database/*.py", "data/seed", ":(glob)qa/p6/*.py", "qa/p6/model_cases.json",
+              "docs/design/api-contract-v0.4.json"]
     try:
         head = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=root, check=True,
                               capture_output=True).stdout.decode("ascii").strip()
@@ -103,12 +104,10 @@ def main(argv: list[str] | None = None) -> int:
                 print("无法确认本地 Git 版本，本轮被测提交将记为未记录。", file=sys.stderr)
         base_url = f"http://127.0.0.1:{args.port}"
         if not args.skip_prepare:
-            if not args.db.exists():
-                code = run([args.python, str(HERE / "prepare_demo_data.py"), "--db", str(args.db), "--yes"], env=env)
-                if code:
-                    return code
-            else:
-                print(f"数据库已存在：{args.db}（补充未发布的种子可手动运行 prepare_demo_data.py）")
+            code = run([args.python, str(HERE / "prepare_demo_data.py"), "--db", str(args.db),
+                        "--yes", "--if-empty"], env=env)
+            if code:
+                return code
         env["ZHIYA_DB_PATH"] = str(args.db.resolve())
         if not args.text_model_live:
             env["MODEL_API_KEY"] = ""

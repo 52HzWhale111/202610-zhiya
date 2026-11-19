@@ -12,6 +12,8 @@ import httpx
 import pytest
 
 import build_test_doc
+import common
+import prepare_demo_data
 import run_acceptance
 import run_model_compare as runner
 import run_p6
@@ -252,3 +254,53 @@ def test_security_header_status_matches_evidence(acceptance, frame, policy, expe
     assert result.status == expected
     assert result.evidence["missing"] == ([] if policy else ["content-security-policy"])
     assert result.evidence["invalid"] == (["x-frame-options"] if frame == "unknown" else [])
+
+
+def test_reachability_does_not_stand_in_for_browser_flow():
+    probe = {"case_id": "TC-P6-FE-001", "title": "首页", "ac": "NFR-01", "status": "PASS", "detail": "HTTP 200"}
+    rendered, _, _ = build_test_doc.render(build_test_doc.TEMPLATE.read_text("utf-8"), {"results": [probe]})
+    assert next(line for line in rendered.splitlines() if "| 前端页面可达 |" in line).endswith("| PASS（通过） |")
+    assert next(line for line in rendered.splitlines() if "| 前端端到端 |" in line).endswith("| 本轮未执行 |")
+
+
+def test_contract_checks_each_method(acceptance):
+    paths = {}
+    for op in json.loads(run_acceptance.CONTRACT.read_text("utf-8"))["endpoints"]:
+        paths.setdefault(op["path"], {})[op["method"].lower()] = {}
+    route = "/api/v1/admin/knowledge-items"
+    acceptance.anon.get.return_value = httpx.Response(200, json={"paths": paths})
+    assert acceptance.test_openapi_coverage()[1]["missingOperations"] == []
+    del paths[route]["post"]
+    paths[route]["parameters"] = []
+    acceptance.anon.get.return_value = httpx.Response(200, json={"paths": paths})
+    warning = acceptance.test_openapi_coverage()
+    assert warning.evidence["missingOperations"] == [f"POST {route}"]
+    assert warning.evidence["missingPaths"] == warning.evidence["extraOperations"] == []
+
+
+def test_empty_database_recovers_after_seed_failure(tmp_path, monkeypatch):
+    database = tmp_path / "demo.sqlite3"
+    with monkeypatch.context() as patch:
+        patch.setattr(prepare_demo_data, "import_seed", Mock(side_effect=OSError("中断")))
+        with pytest.raises(OSError, match="中断"):
+            prepare_demo_data.ensure_database(database)
+    monkeypatch.setattr("sys.argv", ["prepare_demo_data", "--db", str(database), "--yes", "--if-empty"])
+    assert prepare_demo_data.main() == 0
+    counts = prepare_demo_data.check(database)
+    assert counts["publishedVersions"] > 0 and counts["accounts"] > 0
+    monkeypatch.setattr(prepare_demo_data, "approve_content", Mock(side_effect=AssertionError("重复准备")))
+    assert prepare_demo_data.main() == 0
+
+
+def test_same_second_keeps_each_acceptance_archive(tmp_path, monkeypatch):
+    monkeypatch.setattr(common, "stamp", lambda: "20261119-120000")
+    for version in ("A", "B"):
+        rec = common.Recorder()
+        rec.meta["testedCommit"] = version
+        common.write_reports(rec, tmp_path)
+    archived = [p for p in tmp_path.glob("acceptance-*.json") if p.name != "acceptance-latest.json"]
+    assert len(archived) == 2
+    assert {json.loads(p.read_text("utf-8"))["meta"]["testedCommit"] for p in archived} == {"A", "B"}
+    for p in archived:
+        assert p.with_suffix(".md").exists() and p.with_suffix(".xml").exists()
+    assert json.loads((tmp_path / "acceptance-latest.json").read_text("utf-8"))["meta"]["testedCommit"] == "B"

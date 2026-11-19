@@ -43,9 +43,17 @@ def connect(path: Path, *, create: bool = False) -> sqlite3.Connection:
 
 
 def ensure_database(path: Path) -> bool:
-    """返回是否新建了数据库。缺失时直接执行 schema 与种子导入。"""
+    """初始化新库或恢复未完成种子导入的空库，返回本次是否进行了初始化。"""
     if path.exists():
-        return False
+        with closing(connect(path)) as db:
+            tables = {row[0] for row in db.execute(
+                "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*'")}
+            if tables and not {"accounts", "storybooks"}.issubset(tables):
+                return False
+            for table in tables:
+                name = table.replace('"', '""')
+                if db.execute(f'SELECT 1 FROM "{name}" LIMIT 1').fetchone():
+                    return False
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(connect(path, create=True)) as db, db:
         db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA.read_text(encoding="utf-8"))
@@ -166,6 +174,7 @@ def main() -> int:
     parser.add_argument("--nickname", default="小芽", help="演示幼儿昵称")
     parser.add_argument("--limit", type=int, default=12, help="最多发布多少本绘本；0 表示全部")
     parser.add_argument("--yes", action="store_true", help="确认修改数据库")
+    parser.add_argument("--if-empty", action="store_true", help="一键启动时仅准备新库或未导入数据的空库")
     parser.add_argument("--check-only", action="store_true", help="只查看当前数据库状态")
     args = parser.parse_args()
 
@@ -184,7 +193,11 @@ def main() -> int:
                           "path": str(path)}, ensure_ascii=False, indent=2))
         return 2
 
-    created = ensure_database(path)
+    existed = path.exists()
+    initialized = ensure_database(path)
+    if args.if_empty and not initialized:
+        print(f"复用已有数据库：{path}")
+        return 0
     with closing(connect(path)) as db, db:
         db.execute("BEGIN IMMEDIATE")
         admin_id = ensure_account(db, f"{args.account}-admin", args.password, "ADMIN")
@@ -195,7 +208,7 @@ def main() -> int:
     story_ids = [item["storyVersionId"] for item in approved["storyVersions"]]
     result = {
         "path": str(path),
-        "databaseCreated": created,
+        "databaseCreated": not existed,
         "demoAccount": args.account,
         "guardianId": guardian_id,
         "profile": profile,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import re
 from collections import Counter
@@ -175,6 +176,8 @@ def main(argv: list[str] | None = None) -> int:
     protected = ARCHIVED_FILES | {TEMPLATE, args.template.resolve(), args.acceptance.resolve()}
     if protected.intersection(outputs) or len(set(outputs)) != len(outputs):
         parser.error("请为复测文档指定独立的输出路径，保留验收输入、模板和历史归档")
+    if docx and importlib.util.find_spec("docx") is None:
+        parser.error("Word 导出需要 python-docx。请用当前 Python 执行 -m pip install -r qa/p6/requirements-docs.txt，或传 --no-docx")
     markdown.parent.mkdir(parents=True, exist_ok=True)
     markdown.write_text(text, encoding="utf-8")
     print(f"复测报告：{markdown}")

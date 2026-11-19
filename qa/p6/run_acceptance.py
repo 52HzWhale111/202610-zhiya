@@ -47,19 +47,9 @@ from common import (
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUT = ROOT / "qa" / "p6" / "reports"
 
-CONTRACT_PATHS = {
-    "/api/v1/auth/registrations", "/api/v1/auth/sessions", "/api/v1/auth/sessions/current",
-    "/api/v1/auth/parent-unlocks", "/api/v1/child-profiles", "/api/v1/child-profiles/{profile_id}",
-    "/api/v1/storybooks", "/api/v1/story-versions/{version_id}", "/api/v1/recommendations",
-    "/api/v1/reading-sessions", "/api/v1/reading-sessions/{session_id}",
-    "/api/v1/reading-sessions/{session_id}/events", "/api/v1/reading-sessions/{session_id}/questions",
-    "/api/v1/reading-sessions/{session_id}/guidance", "/api/v1/reading-sessions/{session_id}/branches",
-    "/api/v1/reading-sessions/{session_id}/completions", "/api/v1/reading-sessions/{session_id}/mode-settings",
-    "/api/v1/voice/transcriptions", "/api/v1/voice/syntheses", "/api/v1/media/{resource_key}",
-    "/api/v1/story-generations", "/api/v1/story-versions/{version_id}/approvals",
-    "/api/v1/admin/storybooks", "/api/v1/admin/story-versions/{version_id}",
-    "/api/v1/admin/knowledge-items", "/api/v1/admin/knowledge-items/{knowledge_id}", "/api/v1/health",
-}
+CONTRACT = ROOT / "docs" / "design" / "api-contract-v0.4.json"
+HTTP_METHODS = {"get", "head", "post", "put", "patch", "delete", "options", "trace"}
+
 
 SECURITY_HEADERS = {
     "x-content-type-options": {"nosniff"},
@@ -716,14 +706,21 @@ class Acceptance:
     def test_openapi_coverage(self) -> tuple[str, dict]:
         response = self.anon.get("/openapi.json")
         body = expect(response, 200, label="OpenAPI")
-        actual = set(body.get("paths", {}))
-        self.openapi_paths = actual
-        missing = sorted(CONTRACT_PATHS - actual)
-        extra = sorted(actual - CONTRACT_PATHS)
-        if not missing:
-            return f"全部 {len(CONTRACT_PATHS)} 个契约路径已注册", {"missingPaths": [], "extraPaths": extra}
-        return Warn(f"契约路径 {len(CONTRACT_PATHS)} 个，已实现 {len(CONTRACT_PATHS & actual)} 个；"
-                    f"未实现 {len(missing)} 个", {"missingPaths": missing, "extraPaths": extra})
+        paths = body["paths"]
+        endpoints = json.loads(CONTRACT.read_text(encoding="utf-8"))["endpoints"]
+        expected = {f"{item['method'].upper()} {item['path']}" for item in endpoints}
+        actual = {f"{method.upper()} {path}" for path, operations in paths.items()
+                  for method in operations if method in HTTP_METHODS}
+        self.openapi_operations = actual
+        missing = sorted(expected - actual)
+        expected_paths = {item["path"] for item in endpoints}
+        evidence = {"missingOperations": missing, "extraOperations": sorted(actual - expected),
+                    "missingPaths": sorted(expected_paths - paths.keys()),
+                    "extraPaths": sorted(paths.keys() - expected_paths)}
+        if missing:
+            return Warn(f"已注册 {len(expected) - len(missing)}/{len(expected)} 个契约操作，缺少：" + "、".join(missing),
+                        evidence)
+        return f"全部 {len(expected)} 个契约操作已注册", evidence
 
     def test_frontend(self) -> str:
         if not self.args.frontend_url:
@@ -869,13 +866,13 @@ class Acceptance:
                             "本轮为本地 profile")
 
         # 契约可能比验收驱动更新，以本轮路径观测区分缺失与功能未测。
-        paths = getattr(self, "openapi_paths", None)
+        operations = getattr(self, "openapi_operations", None)
 
         def pending(*routes: str) -> str:
-            if paths is None:
+            if operations is None:
                 return "未取得本轮 OpenAPI，功能用例尚未执行"
-            missing = [route for route in routes if route not in paths]
-            return "本轮契约路径缺失：" + "、".join(missing) if missing else "路由已注册，本轮未执行功能用例"
+            missing = [f"POST {route}" for route in routes if f"POST {route}" not in operations]
+            return "本轮契约操作缺失：" + "、".join(missing) if missing else "路由已注册，本轮未执行功能用例"
 
         for case_id, title, ac, reason in (
                 ("TC-P6-AGENT-001", "情境提问 API-016 与适龄问题", "AC-05",

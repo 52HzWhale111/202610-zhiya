@@ -98,6 +98,7 @@ python qa/p6/summarize_model_compare.py
 ## 边界与注意
 
 - `run_p6.py --outdir <目录>` 将黑盒报告、缺陷台账和模型子目录写入同一轮输出。
+- 导出 Word 时，先在运行报告脚本的同一虚拟环境执行 `python -m pip install -r qa/p6/requirements-docs.txt`。仅导出 Markdown 可跳过此依赖。
 - `python qa/p6/build_test_doc.py --acceptance <JSON>` 在该 JSON 旁的 `retests/` 下生成本轮 Markdown 和 Word 报告，文件名包含输入指纹，日期和提交取自运行记录。可用 `--markdown <新路径>`、`--docx <新路径>` 指定输出，或用 `--no-docx` 仅生成 Markdown。11 月 18 日交付的文档、演示脚本及 PDF 保留原版。
 - 黑盒脚本不导入后端代码，不读取 `.env`，不接触真实密钥。
 - 一键入口和演示默认跳过已鉴权的有效合成请求。明确确认被测服务禁用 TTS 后，传 `--voice-expect-unconfigured` 验证 503；真实语音使用 `--voice-live`（演示为 `--voice`），遇 503 不能判为真实合成通过。
